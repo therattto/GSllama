@@ -769,13 +769,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cparams.causal_attn && !hparams.use_alibi;
 
     // sorting the block scores instead of the per cell ones. see the comment further down.
-    // on by default: measured at ctx 65536 with ub 1536 it is worth 4,4% of prefill and 12,4%
-    // of decode, and the reason is the graph, not the arithmetic: dropping the per cell gather
-    // removes one split per sparse layer, 57 -> 45 at bs=1536 and 43 -> 31 at bs=1.
+    // worth 4,4% of prefill and 12,4% of decode at ctx 65536 with ub 1536, and the reason is the
+    // graph, not the arithmetic: dropping the per cell gather removes one split per sparse layer,
+    // 57 -> 45 at bs=1536 and 43 -> 31 at bs=1.
     // one sequence only: with several, a block can mix them and only the per cell mask can tell
+    //
+    // OFF by default, opt in with LLAMA_QSA_BLK_TOPK=1. It was on, and it lost the Vulkan device
+    // on a 27674 token prompt when combined with RADV_PERFTEST=nogttspill, which is what the
+    // production launcher uses. The driver says why: "radv/amdgpu: Not enough memory for command
+    // submission", so it is memory exhaustion rather than a bad index, and without the GTT
+    // fallback that nogttspill removes it is fatal. A 2x2 of top-k mode against nogttspill is
+    // unambiguous: only that one cell dies, three runs out of three, while the other three cells
+    // answer a needle-in-a-haystack question correctly and identically. Retrieval quality is
+    // therefore fine; the residency is not. Turn it back on once the extra VRAM is found and
+    // removed, and re-measure WITH nogttspill, because the benchmark harness does not set it
     static const bool blk_topk_env = [] {
         const char * e = getenv("LLAMA_QSA_BLK_TOPK");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
 
     const bool blk_topk = blk_topk_env && blk_bias && n_stream == 1 && cparams.n_seq_max == 1;
