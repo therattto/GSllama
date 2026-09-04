@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // NextN/MTP: an extra decoder block appended past the trunk. Read this first, since
@@ -679,8 +680,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool blk_topk) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), blk_topk(blk_topk) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -705,8 +706,12 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_blk->ne[0]  == n_kv;
-        res &= cell_blk->ne[1]  == n_stream;
+        // con il top-k per blocco cell_blk non esiste; blk_cells e blk_pos qui sotto
+        // portano gia' n_blocks, che e' n_kv diviso il ratio
+        if (cell_blk) {
+            res &= cell_blk->ne[0] == n_kv;
+            res &= cell_blk->ne[1] == n_stream;
+        }
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
@@ -727,6 +732,9 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // the block level top-k never reads cell_blk, so the tensor is not built and not filled
+    const bool blk_topk;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -760,6 +768,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
+    // sorting the block scores instead of the per cell ones. see the comment further down.
+    // on by default: measured at ctx 65536 with ub 1536 it is worth 4,4% of prefill and 12,4%
+    // of decode, and the reason is the graph, not the arithmetic: dropping the per cell gather
+    // removes one split per sparse layer, 57 -> 45 at bs=1536 and 43 -> 31 at bs=1.
+    // one sequence only: with several, a block can mix them and only the per cell mask can tell
+    static const bool blk_topk_env = [] {
+        const char * e = getenv("LLAMA_QSA_BLK_TOPK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    const bool blk_topk = blk_topk_env && blk_bias && n_stream == 1 && cparams.n_seq_max == 1;
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -767,15 +787,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, blk_topk);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        // un input che nessun nodo legge non viene allocato, e set_input scriverebbe su un
+        // puntatore nullo: con il top-k per blocco cell_blk non si costruisce proprio
+        qsa->cell_blk  = blk_topk ? nullptr : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
+        if (qsa->cell_blk) {
+            ggml_set_input(qsa->cell_blk);
+        }
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
@@ -830,18 +854,73 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+    ggml_tensor * q_flat = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream);
+
+    ggml_tensor * score = nullptr;
+
+    if (blk_topk) {
+        // Same numbers, one big tensor less. Multiplying the other way round puts the head
+        // index in dimension zero, which is the one sum_rows adds up, so the transpose that
+        // only existed to feed sum_rows disappears. It weighed [n_blocks, n_idx_h, n_tokens]
+        // in f32, 384 MiB at ctx 65536 with ub 1536, and the allocator showed it living
+        // side by side with the mul_mat result at the exact peak of the compute buffer.
+        // The single stream requirement is the same one the block top-k already carries.
+        score = ggml_mul_mat(ctx0, q_flat, pooled);
+
+        // the relu goes before the reshape, and the order matters for memory, not for the
+        // numbers: it is elementwise either way. The allocator refuses to write in place into
+        // a view ("not reusing parent (reshaped) ... as (nil) is external"), so with the
+        // reshape first the rectified copy is a second [n_blocks, n_idx_h, n_tokens] buffer,
+        // 384 MiB at ctx 65536 with ub 1536, alive next to the one it rectifies. Applied to
+        // the mul_mat result directly it reuses it.
+        score = ggml_relu(ctx0, score);
+        score = ggml_reshape_4d(ctx0, score, n_idx_h, n_tps, n_blocks, n_stream);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_3d(ctx0, score, n_tps, n_blocks, n_stream);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+    } else {
+        score = ggml_mul_mat(ctx0, pooled, q_flat);
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+    }
     cb(score, "indexer_score", il);
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
     if (blk_bias) {
         score = ggml_add(ctx0, score, inp->bias);
+    }
+
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    // Two ways to reach the same selection. The per cell path expands the block scores to one
+    // score per cache cell and sorts n_kv of them; the per block path sorts n_blocks of them and
+    // expands the winners afterwards. The selection is the same set of whole blocks either way,
+    // because every cell of a block carries its block's score, but the per block path never
+    // materialises the [n_kv, n_tokens] tensors, which at ctx 65536 and ub 1536 weigh 402 MiB each.
+    //
+    // It needs the per block bias to carry causality on its own, which set_input_qsa now does, and
+    // it needs a single stream so the gather below can flatten tokens into one dimension.
+    if (blk_topk) {
+        const int64_t width_blk = std::min<int64_t>(n_blocks, (width + r - 1)/r);
+
+        ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, score, width_blk));
+        cb(sel, "indexer_top_k_blocks", il);
+
+        // blk_cells lists the r cache cells of every block, in position order
+        ggml_tensor * bc = ggml_reshape_2d(ctx0, inp->blk_cells, r, n_blocks);
+
+        // get_rows wants the index tensor flat in ne[1], hence the single stream requirement
+        ggml_tensor * cells = ggml_get_rows(ctx0, bc,
+                ggml_reshape_1d(ctx0, sel, width_blk*n_tps));
+
+        ggml_tensor * top_k = ggml_reshape_4d(ctx0, cells, r*width_blk, n_tps, 1, n_stream);
+        cb(top_k, "indexer_top_k", il);
+
+        return top_k;
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
@@ -857,9 +936,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
     cb(expanded, "indexer_score_tokens", il);
-
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
 

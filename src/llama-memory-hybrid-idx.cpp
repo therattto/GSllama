@@ -360,10 +360,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // cell_blk is absent when the caller sorts the block scores instead of the per cell ones
+    GGML_ASSERT(cell_blk == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_kv     = cell_blk ? cell_blk->ne[0] : (int64_t) get_idx()->get_n_kv();
+    const int64_t n_ns     = cell_blk ? cell_blk->ne[1] : blk_cells->ne[1];   // streams in this ubatch
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
@@ -371,7 +372,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
@@ -395,7 +396,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
@@ -430,11 +431,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
         // per-cell mode carries that -inf itself and only needs the gather in range
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
-                blk_of[j] = -1;
+        if (cur_cell_blk) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
+                    blk_of[j] = -1;
+                }
+                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -451,6 +454,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
+                    // a block whose first cell is already past the query is entirely future.
+                    // the attention mask kills those cells anyway, so this line changes nothing
+                    // for the per cell top-k, but a block level top-k has no mask to lean on and
+                    // would otherwise spend its budget on blocks the ubatch has just written.
+                    if (b*r > q) {
+                        cur_blk_bias[b] = -INFINITY;
+                        continue;
+                    }
+
                     // finite, so it can never meet a -inf and produce a nan
                     cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
                 }
