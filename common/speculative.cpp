@@ -2572,6 +2572,24 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // il modello draft riserva sempre sul contesto pieno. limitare anche la sua riserva
+    // (cioe' ereditare -ckv dal target) fa crollare il decode di oltre il doppio: misurato
+    // 11,9 t/s contro 26,8, mentre a speculazione spenta lo stesso -ckv era neutro
+    cparams.n_kv_reserve = 0;
+
+    // L'ubatch della bozza puo' essere piu' piccolo di quello del bersaglio.
+    // Serve perche' il contesto di bozza dimensiona il proprio buffer di
+    // calcolo sull'ubatch, e attraversa il prompt a blocchi di quella misura
+    // (vedi il ciclo su n_ubatch_dft piu' sotto): con un bersaglio a ub 2048 il
+    // buffer della bozza cresce senza che le serva, e su una scheda al limite
+    // della VRAM il risultato e' un timeout della coda di calcolo.
+    if (params.speculative.draft.n_ubatch > 0) {
+        cparams.n_ubatch = params.speculative.draft.n_ubatch;
+        if (cparams.n_batch < cparams.n_ubatch) {
+            cparams.n_batch = cparams.n_ubatch;
+        }
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;

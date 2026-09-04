@@ -741,6 +741,22 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+void llama_kv_cache::set_reserve_limit(uint32_t n_kv_max) {
+    n_kv_reserve = n_kv_max;
+}
+
+uint32_t llama_kv_cache::get_reserve_n_kv() const {
+    if (n_kv_reserve == 0) {
+        return get_size();
+    }
+
+    // stesso arrotondamento di get_n_kv(), cosi' il grafo riservato ha la stessa forma
+    // di quelli che verranno costruiti davvero
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    return std::min(get_size(), std::max(n_pad_cur, GGML_PAD(n_kv_reserve, n_pad_cur)));
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -2706,7 +2722,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    n_kv = kv->get_reserve_n_kv();
 
     const uint32_t n_stream = kv->get_n_stream();
 

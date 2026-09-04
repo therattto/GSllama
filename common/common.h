@@ -331,6 +331,13 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // ubatch fisico del contesto di bozza. 0 significa "eredita quello del
+    // modello principale", che era il comportamento unico prima di questa
+    // aggiunta. La bozza attraversa tutto il prompt anche lei, a blocchi da
+    // n_ubatch, quindi il suo buffer di calcolo cresce con l'ubatch del
+    // bersaglio pur non avendone bisogno.
+    int32_t n_ubatch = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -448,6 +455,7 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+    int32_t n_kv_reserve          =     0; // n_kv usato per dimensionare i buffer di calcolo, 0 == contesto pieno
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt

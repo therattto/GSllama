@@ -10,6 +10,7 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t n_kv_reserve;    // n_kv usato per riservare il buffer di calcolo (0 = contesto pieno)
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
