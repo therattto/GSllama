@@ -1,126 +1,161 @@
-# llama.cpp
+# GSllama
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+A llama.cpp fork tuned for **two GPUs from different vendors in one process**:
+an NVIDIA RTX 4080 Super (CUDA) and an AMD RX 7900 XTX (Vulkan), driven
+together by a single `llama-server`.
 
-<div align="center">
+Most of the work here came out of making that combination fast on a
+memory-starved desktop, and measuring every step instead of guessing.
 
-<b>LLM inference in C/C++</b>
+## Why this exists
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+Running one model across a CUDA card and a Vulkan card at the same time works
+in llama.cpp, but almost nothing is written down about *how it behaves*. The
+useful surprises were not in the model code, they were in memory accounting,
+graph reuse, and PCIe topology.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+The machine, for context, because every number below is tied to it:
 
-</div>
+| | |
+|---|---|
+| CPU / RAM | Ryzen 7 5800X3D, 32 GB DDR4-3600 (2 DIMM slots, hard cap 64 GB) |
+| GPU 0 | RTX 4080 Super 16 GB, PCIe 4.0 x16 from the CPU |
+| GPU 1 | RX 7900 XTX 24 GB, 8 GT/s x4 behind the chipset |
+| Board | Gigabyte B550I AORUS PRO AX, Mini-ITX, one x16 slot |
+| Model | Qwen3.8-Flash-Next (MoE) at UD-Q2_K_XL, 78.9 GB, 200k context |
 
-## Quick start
+A 79 GB model on 40 GB of VRAM and 32 GB of RAM. That constraint is what
+produced most of the patches.
 
-A few options to get `llama.cpp` installed on your machine:
+## Results
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+All figures below are the **same model, same quantization, same 200k context**,
+measured with a 9109-token prompt on the machine in the table above. Median of
+three warm runs; the first run is always discarded as warm-up. Run-to-run
+dispersion on the swap measurement was 0.50% and 0.62%.
 
-Once installed:
+| stage | prefill | decode |
+|---|---|---|
+| early working config (`-ub 1024`, `-ts 27/21`) | 132 t/s | 25.2 t/s |
+| after parameter tuning and the patches here | 306 t/s | 28.4 t/s |
+| **after swapping the two cards** (NVIDIA into the CPU x16 slot) | 900 t/s | 28.1 t/s |
+| **delivered configuration** | **920 t/s** | **29 t/s** |
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+**Prefill ended up 7x the starting point. Be clear about where that came from:**
+about **2.3x was software** (tuning plus the patches in this repository) and
+about **2.9x was one screwdriver**, moving the NVIDIA card out of the chipset
+x4 link and into the CPU x16 slot. Decode barely moved throughout, +15% total,
+because at batch 1 the link is not the constraint.
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
-```
+That split is the single most useful thing in this repository. On a machine
+with an MoE model streaming experts from RAM, **prefill is bounded by the PCIe
+link of whichever card computes the offloaded experts**, and no amount of code
+will buy back a x4 slot.
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Two findings that transfer to stock llama.cpp, no patches needed:
 
-## Description
+- **`-ub 2048` instead of the default `-ub 512` was worth 2.28x prefill**
+  (108.75 to 247.52 t/s, measured at a 32k context) at no cost in layer
+  placement: the larger ubatch needed no extra layers moved to CPU. The
+  per-ubatch fixed cost dominates, so this is much larger than it looks.
+- **`-ts` does not decide who computes CPU-resident experts.** The first
+  backend named in `-dev` does. Getting this backwards silently sends all
+  expert traffic across the wrong link.
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+The delivered configuration is validated at **198,168 tokens of context**,
+5 needles out of 5 retrieved at every depth, with a sabotage cell that
+correctly loses all of them.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## What is in here
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+Grouped by how general it is. **The first group is not specific to any model**
+and is the part intended for upstream.
 
-## Supported backends
+### Generic
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+- **`llama`: size the compute buffers for `-ckv` tokens, not the full context.**
+  llama.cpp reserves a worst-case graph sized on the *configured* context. On
+  this machine that buffer was worth **five times the KV cache**, and it is
+  what decides whether a configuration loads at all. Adding a separate
+  compute-window argument made a 200k-context setup fit where it previously
+  did not.
+- **`ggml-cuda`: key the CUDA graph cache by shape.** Plus counters for graph
+  optimization forks (total / rescued / skipped). In three and a half hours of
+  production this fork reports **72,817 graph reuses and zero reallocations**.
+- **`ggml-backend`: count graph reallocations instead of aborting.** Sixteen
+  lines. An abort tells you it happened once; a counter tells you how often,
+  which is the number you actually need.
+- **`ggml-backend`: keep big single-row sources on one backend.** A scheduler
+  gate (`GGML_SCHED_BIGSRC*`) that stops large single-row tensors from being
+  copied across the PCIe boundary every step.
+- **`ggml-cuda`: wait for VRAM instead of failing.** `GGML_CUDA_WAIT_MEM_MS`.
+  A process that has just exited does not return its VRAM immediately, and the
+  resulting OOM blames the wrong thing. See the notes repo, this one cost a
+  full session to diagnose.
 
-## Documentation
+### Vulkan, on AMD
 
-#### Tools
+- **Fused `sigmoid` + `mul`**, and **`hc_combine`** for hyper-connections, with
+  the two shaders. On the 7900 XTX the cost is dominated by *dispatches*, not
+  arithmetic. Profiling showed 827 GPU pipeline flushes per token at roughly
+  4.8 us each, while the host side accounted for only 9.7% of the time.
+  Folding operations together removed 104 ops in one change and 68 barriers in
+  another, for a few percent of decode each.
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+### Qwen3.8-Flash-Next specific
 
-#### Development
+- Per-block top-k for the sparse indexer, recurrent conv state rollback, and
+  MTP draft loading. These only apply to the `qwen4exp` architecture.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+## Things that cost us time, so they may save you some
 
-## Contributing
+- **`lspci` at idle tells you the opposite of the truth** on Navi 31. The XTX
+  reports `16GT/s x16` because the card presents itself as an internal switch,
+  and an idle GeForce reports `2.5GT/s` because of power saving. Read the
+  **upstream bridge**, not the endpoint.
+- **Expert offload goes to the first backend named in `-dev`**, regardless of
+  what `-ts` says. `-ts` splits layers; it does not decide who computes the
+  CPU-resident experts.
+- **Deliverability is decided by the startup graph reserve, not by
+  steady-state VRAM.** A configuration that looks lightest in `nvidia-smi`
+  during generation can have a reserve that does not fit. It is only visible
+  with `-lv 5`.
+- **Read GTT alongside VRAM.** On AMD, memory that "fits" may have quietly
+  spilled to system memory over PCIe. VRAM alone looks fine while performance
+  is halved.
+- **PCIe topology dominated everything.** Moving the NVIDIA card from the
+  chipset x4 link into the CPU x16 slot **nearly tripled prefill** on an
+  otherwise identical configuration. No software change came close.
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+## Attribution, and what is *not* ours
 
-## Acknowledgements
+- Base: [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp), which
+  tracks [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp).
+- **`src/models/qwen4exp.cpp` is not our work.** It was written by **Daniel
+  Han** (Unsloth) and added upstream on 27 August 2026, 1728 lines. Everything
+  we did to that file is optimization on top of an architecture that already
+  worked.
+- Everything else in llama.cpp belongs to its authors. This fork adds patches,
+  it does not claim the project.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+## Honest warnings
+
+- **This is a fork, and forks go stale.** The base here is from late August
+  2026. llama.cpp merges dozens of pull requests a week. If you are reading
+  this much later, prefer upstream and treat this repository as a source of
+  patches and notes, not as something to run.
+- **The numbers are tied to the machine in the table above.** The *methods*
+  generalize; the figures do not. Two GPUs on different links behave nothing
+  like two identical cards.
+- The generic patches are intended to be proposed upstream. If they land
+  there, that is the version you want.
+
+## License
+
+MIT, same as llama.cpp upstream. See [LICENSE](LICENSE).
+
+---
+
+The upstream llama.cpp README is preserved here as
+[README.llama.cpp.md](README.llama.cpp.md). For build instructions, supported
+models, and everything not specific to this fork, read that one.
