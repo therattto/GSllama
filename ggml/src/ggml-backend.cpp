@@ -840,6 +840,13 @@ struct ggml_backend_sched {
     int n_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // [GGML_SCHED_BIGSRC_GATE] the current graph is single-row (decode), so the
+    // byte-weighted BIGSRC scoring is allowed to act. llama sets it through
+    // ggml_backend_sched_set_bigsrc_single_row: reserve graphs and prefill
+    // graphs leave it false. calloc starts it false, but it is written
+    // explicitly in ggml_backend_sched_new anyway
+    bool bigsrc_single_row;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1064,6 +1071,174 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// ---------------------------------------------------------------------------
+// [GGML_SCHED_BIGSRC] the split plan is blind to bytes: neither the pass 2
+// expansion nor the pass 3 scoring looks at sizes, they count inputs. As a
+// result the router MUL and the nine ADDs of the expert sum take the dense
+// layers' backend by contiguity, and the output of the MUL_MAT_ID the CPU has
+// just computed (100K per layer, 24 layers) crosses the link on every token
+// instead of staying where it was produced.
+// The big_crossing helper reports whether the node has a graph-born source of at
+// least GGML_SCHED_BIGSRC_BYTES bytes that will not end up on the backend
+// currently expanding it: in that case the node is left uncovered and pass 3
+// decides it by bytes.
+// Weights never count: they are leaves with op == GGML_OP_NONE, they live on the
+// CPU because they are the -ncmoe layers, and leaving the 400M prefill
+// MUL_MAT_ID uncovered would disable the offload entirely.
+// Switch idiom: off by default, absent means off.
+// ---------------------------------------------------------------------------
+
+#define GGML_SCHED_BIGSRC_BYTES     ((size_t) 64 * 1024)
+#define GGML_SCHED_BIGSRC_MAX_DEPTH 3
+
+static bool ggml_backend_sched_bigsrc(void) {
+    static bool     bigsrc_init = false;
+    static bool     bigsrc_on   = false;
+    if (!bigsrc_init) {
+        const char * e        = getenv("GGML_SCHED_BIGSRC");
+        bigsrc_on             = e != nullptr && atoi(e) != 0;
+        bigsrc_init           = true;
+        GGML_LOG_INFO("%s: GGML_SCHED_BIGSRC=%d (soglia %zu byte, profondita' max %d)\n",
+                     __func__, bigsrc_on ? 1 : 0,
+                     GGML_SCHED_BIGSRC_BYTES, GGML_SCHED_BIGSRC_MAX_DEPTH);
+    }
+    return bigsrc_on;
+}
+
+// [GGML_SCHED_BIGSRC_GATE] the single-row gate. Idiom: unset means off, same as
+// GGML_SCHED_BIGSRC. It is needed because the earlier byte-weighted scoring also
+// acted where it must not: in prefill graphs, where relocating the router head
+// removes the offload, and in reserve graphs, where it reshuffles the worst-case
+// graph's placements (measured at +1568 MiB in GTT at load)
+static bool ggml_backend_sched_bigsrc_gate(void) {
+    static bool     gate_init = false;
+    static bool     gate_on   = false;
+    if (!gate_init) {
+        const char * e = getenv("GGML_SCHED_BIGSRC_GATE");
+        gate_on   = e != nullptr && atoi(e) != 0;
+        gate_init = true;
+    }
+    return gate_on;
+}
+
+// with the gate off this expression reduces to bigsrc(), character for
+// character, so the reference behaviour is unchanged
+static bool ggml_backend_sched_bigsrc_active(ggml_backend_sched_t sched) {
+    if (!ggml_backend_sched_bigsrc()) {
+        return false;
+    }
+    if (!ggml_backend_sched_bigsrc_gate()) {
+        return true;
+    }
+    if (!sched->bigsrc_single_row) {
+        return false;
+    }
+    static bool gate_logged = false;
+    if (!gate_logged) {
+        gate_logged = true;
+        // WARN and not INFO: the common callback cuts verbosity at the
+        // LOG_LEVEL_INFO threshold, so an INFO would not appear in the server log
+        GGML_LOG_WARN("%s: BIGSRC: single-row gate active (byte scoring only acts on single-row graphs)\n", __func__);
+    }
+    return true;
+}
+
+// the tensor that owns the memory: a view of a view walks all the way up
+static struct ggml_tensor * ggml_backend_sched_big_view_root(struct ggml_tensor * t) {
+    while (t->view_src != NULL) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// look up the backend already assigned to a tensor without inserting anything
+// into the hash set: tensor_backend_id() does find_or_insert and writes, and one
+// insertion too many here would give an index past the end of the id array
+static int ggml_backend_sched_big_lookup(ggml_backend_sched_t sched, struct ggml_tensor * t) {
+    const size_t i = ggml_hash_find(&sched->hash_set, t);
+    if (i == GGML_HASHSET_FULL) {
+        return -1;
+    }
+    if (!ggml_bitset_get(sched->hash_set.used, i) || sched->hash_set.keys[i] != t) {
+        return -1;
+    }
+    return sched->hv_tensor_backend_ids[i];
+}
+
+static bool ggml_backend_sched_big_crossing(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int depth) {
+    if (!ggml_backend_sched_bigsrc_active(sched)) {
+        return false;
+    }
+
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        struct ggml_tensor * src = node->src[j];
+        if (src == NULL) {
+            continue;
+        }
+
+        struct ggml_tensor * root = ggml_backend_sched_big_view_root(src);
+        if (root->op == GGML_OP_NONE) {
+            // leaf: a weight, it does not move from where it is
+            continue;
+        }
+
+        const int id = ggml_backend_sched_big_lookup(sched, root);
+        if (id == -1) {
+            // The producer is not placed yet: it will be decided by the same
+            // rule, so we ask it. Without this step the chain of nine ADDs is
+            // taken by contiguity the wrong way round (the pass 2 walk up the
+            // graph visits the ADDs before their producer) and the bytes saved on
+            // the MUL are paid again as copies. The byte test is applied at the
+            // root of the view, because an expert's view is 10K but what is
+            // actually read is the tensor holding it, 100K.
+            if (depth > 0 && ggml_nbytes(root) >= GGML_SCHED_BIGSRC_BYTES &&
+                ggml_backend_sched_big_crossing(sched, root, cur_backend_id, depth - 1)) {
+                return true;
+            }
+            continue;
+        }
+
+        if (id != cur_backend_id && ggml_nbytes(root) >= GGML_SCHED_BIGSRC_BYTES) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// how many bytes read by the node are already on backend b: this is the new
+// pass 3 score, replacing the count of supported inputs. As in the guard, only
+// graph-born sources are counted here, because weights would hand the answer to
+// the prefill MUL_MATs, which must not change
+static size_t ggml_backend_sched_big_src_bytes(ggml_backend_sched_t sched, struct ggml_tensor * node, int backend_id) {
+    if (!ggml_backend_sched_bigsrc_active(sched)) {
+        return 0;
+    }
+
+    size_t nbytes = 0;
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        struct ggml_tensor * src = node->src[j];
+        if (src == NULL) {
+            continue;
+        }
+
+        struct ggml_tensor * root = ggml_backend_sched_big_view_root(src);
+        if (root->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (ggml_backend_sched_big_lookup(sched, root) != backend_id) {
+            continue;
+        }
+        if (!ggml_backend_sched_buffer_supported(sched, src, backend_id)) {
+            continue;
+        }
+
+        nbytes += ggml_nbytes(root);
+    }
+
+    return nbytes;
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1144,7 +1319,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 } else {
                     cur_backend_id = *node_backend_id;
                 }
-            } else if (cur_backend_id != -1) {
+            } else if (cur_backend_id != -1 && !ggml_backend_sched_big_crossing(sched, node, cur_backend_id, GGML_SCHED_BIGSRC_MAX_DEPTH)) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
@@ -1165,7 +1340,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 } else {
                     cur_backend_id = *node_backend_id;
                 }
-            } else if (cur_backend_id != -1) {
+            } else if (cur_backend_id != -1 && !ggml_backend_sched_big_crossing(sched, node, cur_backend_id, GGML_SCHED_BIGSRC_MAX_DEPTH)) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
@@ -1181,7 +1356,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
                 cur_backend_id = *node_backend_id;
-            } else if (cur_backend_id != -1) {
+            } else if (cur_backend_id != -1 && !ggml_backend_sched_big_crossing(sched, node, cur_backend_id, GGML_SCHED_BIGSRC_MAX_DEPTH)) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
@@ -1197,7 +1372,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
                 cur_backend_id = *node_backend_id;
-            } else if (cur_backend_id != -1) {
+            } else if (cur_backend_id != -1 && !ggml_backend_sched_big_crossing(sched, node, cur_backend_id, GGML_SCHED_BIGSRC_MAX_DEPTH)) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
         }
@@ -1220,6 +1395,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         if (*node_backend_id == -1) {
             // unassigned node: find the backend with the most supported inputs
             int n_supported_best = -1;
+            int b_count_best     = -1;
+            // [GGML_SCHED_BIGSRC] the byte-weighted score, replacing the input
+            // count: a node goes where its reads already are
+            size_t n_bytes_best  = 0;
+            int    b_bytes_best  = -1;
             for (int b = 0; b < sched->n_backends; b++) {
                 if (ggml_backend_supports_op(sched->backends[b], node)) {
                     int n_supported = 0;
@@ -1234,10 +1414,26 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     if (n_supported > n_supported_best) {
                         n_supported_best = n_supported;
-                        *node_backend_id = b;
-                        SET_CAUSE(node, "3.best");
+                        b_count_best     = b;
+                    }
+                    // the comparison stays strictly greater, so the first
+                    // maximum wins exactly as it did before
+                    const size_t n_bytes = ggml_backend_sched_big_src_bytes(sched, node, b);
+                    if (n_bytes > n_bytes_best) {
+                        n_bytes_best = n_bytes;
+                        b_bytes_best = b;
                     }
                 }
+            }
+            // If the bytes say nothing (zero score on every backend: tiny
+            // nodes, or nodes whose only sources are weights) the previous count
+            // decides. This is the part that leaves prefill unchanged
+            if (b_bytes_best >= 0 && n_bytes_best > 0) {
+                *node_backend_id = b_bytes_best;
+                SET_CAUSE(node, "3.big");
+            } else if (b_count_best >= 0) {
+                *node_backend_id = b_count_best;
+                SET_CAUSE(node, "3.best");
             }
         } else {
             // assigned node: upgrade to higher prio backend if possible
@@ -1661,6 +1857,45 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// per-split profile, enabled by GGML_SCHED_SPLIT_PROFILE=1
+// GGML_SCHED_SPLIT_PROFILE_SKIP=N  discards the first N calls (default 5), which
+// keeps prefill and warm-up out of the decode statistics.
+// NOTE: while it is on, a synchronization is inserted after every split, so the
+// total time grows and the backends no longer overlap.
+// ---------------------------------------------------------------------------
+struct ggml_sched_prof_entry {
+    int64_t copy_us = 0;
+    int64_t comp_us = 0;
+    int64_t n       = 0;
+    const char * backend_name = "?";
+    int n_nodes = 0;
+    char first[96] = {0};
+};
+
+static bool    g_sched_prof_init    = false;
+static bool    g_sched_prof_on      = false;
+static int64_t g_sched_prof_skip    = 5;
+static int64_t g_sched_prof_calls   = 0;
+static std::unordered_map<int, std::vector<ggml_sched_prof_entry>> g_sched_prof;
+
+static void ggml_sched_prof_report(void) {
+    for (auto & kv : g_sched_prof) {
+        int64_t tot_c = 0, tot_k = 0, calls = 0;
+        for (auto & e : kv.second) { tot_c += e.copy_us; tot_k += e.comp_us; calls = e.n > calls ? e.n : calls; }
+        if (calls == 0) continue;
+        fprintf(stderr, "\n== SPLIT PROFILE: %d splits, %lld graphs, per-graph mean: copy %.3f ms, comp %.3f ms, total %.3f ms\n",
+                kv.first, (long long) calls, tot_c/1000.0/calls, tot_k/1000.0/calls, (tot_c+tot_k)/1000.0/calls);
+        fprintf(stderr, "   id  backend     nodes   copy_ms   comp_ms  first node\n");
+        for (size_t i = 0; i < kv.second.size(); i++) {
+            auto & e = kv.second[i];
+            if (e.n == 0) continue;
+            fprintf(stderr, "  %3zu  %-10s %6d  %8.4f  %8.4f  %s\n",
+                    i, e.backend_name, e.n_nodes, e.copy_us/1000.0/e.n, e.comp_us/1000.0/e.n, e.first);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1671,10 +1906,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    if (!g_sched_prof_init) {
+        g_sched_prof_init = true;
+        const char * pe = getenv("GGML_SCHED_SPLIT_PROFILE");
+        g_sched_prof_on = pe != NULL && atoi(pe) != 0;
+        const char * ps = getenv("GGML_SCHED_SPLIT_PROFILE_SKIP");
+        if (ps != NULL) g_sched_prof_skip = atoi(ps);
+        if (g_sched_prof_on) atexit(ggml_sched_prof_report);
+    }
+    bool rec = false;
+    std::vector<ggml_sched_prof_entry> * prof = NULL;
+    if (g_sched_prof_on) {
+        g_sched_prof_calls++;
+        if (g_sched_prof_calls > g_sched_prof_skip) {
+            rec = true;
+            prof = &g_sched_prof[sched->n_splits];
+            if ((int) prof->size() < sched->n_splits) prof->resize(sched->n_splits);
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t prof_t0 = rec ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1809,6 +2064,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t prof_t1 = rec ? ggml_time_us() : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1845,6 +2102,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
+            }
+        }
+
+        if (rec) {
+            ggml_backend_synchronize(split_backend);
+            const int64_t prof_t2 = ggml_time_us();
+            ggml_sched_prof_entry & e = (*prof)[split_id];
+            e.copy_us += prof_t1 - prof_t0;
+            e.comp_us += prof_t2 - prof_t1;
+            e.n       += 1;
+            e.backend_name = ggml_backend_name(split_backend);
+            e.n_nodes = split->graph.n_nodes;
+            if (e.first[0] == 0 && split->graph.n_nodes > 0) {
+                snprintf(e.first, sizeof(e.first), "%s(%s)",
+                         ggml_op_name(split->graph.nodes[0]->op), split->graph.nodes[0]->name);
             }
         }
 
@@ -1887,6 +2159,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_LOG_REALLOC = getenv("GGML_SCHED_LOG_REALLOC");
     sched->log_realloc = GGML_SCHED_LOG_REALLOC ? atoi(GGML_SCHED_LOG_REALLOC) : 0;
     sched->n_realloc   = 0;
+
+    // [GGML_SCHED_BIGSRC] read once, when the scheduler is created, so the log
+    // line lands at server startup and not in the middle of a request
+    ggml_backend_sched_bigsrc();
+
+    // [GGML_SCHED_BIGSRC_GATE] calloc already starts it false; it is written
+    // explicitly because the single-row marker is request state, not padding
+    sched->bigsrc_single_row = false;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
@@ -1976,6 +2256,14 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+}
+
+// [GGML_SCHED_BIGSRC_GATE] tells the scheduler whether the graph about to be
+// split is single-row. ggml_backend_sched_reset does not touch it, because reset
+// only clears the hash set and the ids: the marker comes from llama and must
+// survive from processing the ubatch through to split_graph
+void ggml_backend_sched_set_bigsrc_single_row(ggml_backend_sched_t sched, bool single_row) {
+    sched->bigsrc_single_row = single_row;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {

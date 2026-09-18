@@ -341,6 +341,10 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // [GGML_SCHED_BIGSRC_GATE] single-row marker for the byte-weighted scoring
+    // done by GGML_SCHED_BIGSRC: llama sets it before the graph is allocated or
+    // split, because only llama knows whether the ubatch is a single row
+    GGML_API void                 ggml_backend_sched_set_bigsrc_single_row(ggml_backend_sched_t sched, bool single_row);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
