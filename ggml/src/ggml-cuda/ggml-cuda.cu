@@ -895,17 +895,17 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     // Vulkan side) and not on the free amount: there the wait fired with 166 MiB
     // free against 1696 requested, exactly when the arithmetic said waiting was
     // pointless, and that is precisely where it worked.
-    const char * e_ats  = getenv("GGML_CUDA_WAIT_MEM_MS");
-    const int    ats_ms = e_ats != nullptr ? atoi(e_ats) : 0;
-    if (ats_ms > 0 && size >= 256u * 1024u * 1024u) {
+    const char * e_wait  = getenv("GGML_CUDA_WAIT_MEM_MS");
+    const int    wait_ms = e_wait != nullptr ? atoi(e_wait) : 0;
+    if (wait_ms > 0 && size >= 256u * 1024u * 1024u) {
         size_t total = 0, free_before = 0, free_after = 0;
         if (cudaMemGetInfo(&free_before, &total) == cudaSuccess) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(ats_ms));
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
             const bool ok = cudaMemGetInfo(&free_after, &total) == cudaSuccess;
             GGML_LOG_WARN("CUDA inventory: allocating %.1f MiB, total %.0f MiB, free from %.0f to %.0f MiB, waited %d ms\n",
                           size / 1048576.0, total / 1048576.0,
                           free_before / 1048576.0,
-                          ok ? free_after / 1048576.0 : -1.0, ats_ms);
+                          ok ? free_after / 1048576.0 : -1.0, wait_ms);
         }
     }
 
@@ -1300,9 +1300,9 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
 static void * ggml_cuda_host_malloc(size_t size) {
     const char * e_np = getenv("GGML_CUDA_NO_PINNED");
     if (e_np != nullptr && atoi(e_np) != 0) {
-        static bool avvisato_np = false;
-        if (!avvisato_np) {
-            avvisato_np = true;
+        static bool warned_np = false;
+        if (!warned_np) {
+            warned_np = true;
             GGML_LOG_WARN("CUDA host buffer: pinning disabled by GGML_CUDA_NO_PINNED, host buffers fall back to the CPU buffer type\n");
         }
         return nullptr;
@@ -4127,10 +4127,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // The forks of this split, counted among the persistent events in the map:
     // they are the execution signature, and the filter on graph_nodes is what
     // keeps the splits of one graph apart from each other
-    size_t n_fork_rilevati = 0;
+    size_t n_forks_found = 0;
     for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
         if (event.graph_nodes == cgraph->nodes) {
-            n_fork_rilevati++;
+            n_forks_found++;
         }
     }
 
@@ -4140,7 +4140,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (n_fork_rilevati > 0) {
+            if (n_forks_found > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
                     // Only this split's events count for its launch: the other
@@ -4329,12 +4329,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // count should be of the same order as the number of dense-attention
             // layers living on the CUDA device; if it stays zero the candidate is
             // dead and no benchmark is worth starting
-            static bool sig_stampata = false;
-            if (n_fork_rilevati > 0 || !sig_stampata) {
-                sig_stampata = true;
-                GGML_LOG_WARN("%s: capture key=%llu, fork rilevati=%zu, lanciati=%d, "
-                              "totali=%llu, scartati=%llu, ricongiunti=%llu\n",
-                              __func__, (unsigned long long) graph_key, n_fork_rilevati,
+            static bool sig_printed = false;
+            if (n_forks_found > 0 || !sig_printed) {
+                sig_printed = true;
+                GGML_LOG_WARN("%s: capture key=%llu, forks found=%zu, launched=%d, "
+                              "total=%llu, skipped=%llu, rescued=%llu\n",
+                              __func__, (unsigned long long) graph_key, n_forks_found,
                               (int) should_launch_concurrent_events,
                               (unsigned long long) ggml_cuda_graph_opt_forks_total.load(std::memory_order_relaxed),
                               (unsigned long long) ggml_cuda_graph_opt_forks_skipped.load(std::memory_order_relaxed),

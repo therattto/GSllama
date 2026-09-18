@@ -264,9 +264,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             return e == nullptr || atoi(e) != 0;
         }();
 
-        const bool radix_conviene = nrows >= 8 || ncols <= 24576;
+        const bool radix_pays = nrows >= 8 || ncols <= 24576;
 
-        if (radix_enabled && radix_conviene &&
+        if (radix_enabled && radix_pays &&
             ncols > 1024 && k <= GGML_CUDA_TOPK_RADIX_MAX_K && k < ncols && nrows > 0) {
             top_k_radix_cuda(src0_d, dst_d, (int) ncols, (int) nrows, (int) k, /*sort_result =*/ true, stream);
             return;

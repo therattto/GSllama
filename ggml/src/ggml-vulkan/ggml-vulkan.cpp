@@ -399,13 +399,13 @@ static double ggml_vk_vram_free_mib() {
         if (dir.empty()) { dir = "-"; }
     }
     if (dir == "-") { return -1.0; }
-    unsigned long long tot = 0, usa = 0;
+    unsigned long long total_bytes = 0, used_bytes = 0;
     FILE * f = fopen((dir + "mem_info_vram_total").c_str(), "r");
-    if (f) { if (fscanf(f, "%llu", &tot) != 1) { tot = 0; } fclose(f); }
+    if (f) { if (fscanf(f, "%llu", &total_bytes) != 1) { total_bytes = 0; } fclose(f); }
     f = fopen((dir + "mem_info_vram_used").c_str(), "r");
-    if (f) { if (fscanf(f, "%llu", &usa) != 1) { usa = 0; } fclose(f); }
-    if (tot == 0) { return -1.0; }
-    return (double)(tot - usa) / 1048576.0;
+    if (f) { if (fscanf(f, "%llu", &used_bytes) != 1) { used_bytes = 0; } fclose(f); }
+    if (total_bytes == 0) { return -1.0; }
+    return (double)(total_bytes - used_bytes) / 1048576.0;
 }
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
@@ -3622,8 +3622,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
                 const char * e = getenv("GGML_VK_WAIT_VRAM_MS");
                 return e != nullptr ? atoi(e) : 3000;
             }();
-            const bool vuole_vram = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
-            if (max_ms > 0 && vuole_vram && size >= 256u * 1024 * 1024) {
+            const bool wants_vram = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
+            if (max_ms > 0 && wants_vram && size >= 256u * 1024 * 1024) {
                 const double needed  = size / 1048576.0 + 128.0;
                 double free_mib = ggml_vk_vram_free_mib();
                 if (free_mib >= 0.0 && free_mib < needed) {
@@ -3635,15 +3635,15 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
                     const double initial = free_mib;
                     const double enough = needed + 1024.0;
                     double prev = free_mib;
-                    int fermi = 0, waited = 0;
+                    int stable = 0, waited = 0;
                     while (waited < max_ms && free_mib < enough) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         waited += 20;
                         free_mib = ggml_vk_vram_free_mib();
                         if (free_mib <= prev + 1.0) {
-                            if (++fermi >= 3) { break; }
+                            if (++stable >= 3) { break; }
                         } else {
-                            fermi = 0;
+                            stable = 0;
                         }
                         prev = free_mib;
                     }
@@ -3698,13 +3698,13 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     // migrates it on its own, which only happens with an 18000-token prompt.
     // GGML_VK_ALLOC_TRACE=1 also prints successful allocations above 64 MiB.
     {
-        static const bool traccia = getenv("GGML_VK_ALLOC_TRACE") != nullptr;
-        const bool voleva_vram = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
+        static const bool do_trace = getenv("GGML_VK_ALLOC_TRACE") != nullptr;
+        const bool wanted_vram = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
         const bool e_in_vram = (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
-        if (voleva_vram && !e_in_vram) {
+        if (wanted_vram && !e_in_vram) {
             GGML_LOG_WARN("ggml_vulkan: %s: %.1f MiB buffer allocated OUTSIDE VRAM (host/GTT)\n",
                           device->name.c_str(), size / 1048576.0);
-        } else if (traccia && size >= 64u * 1024 * 1024) {
+        } else if (do_trace && size >= 64u * 1024 * 1024) {
             GGML_LOG_INFO("ggml_vulkan: %s: ALLOC %.1f MiB, type %s, free vram after %.0f MiB\n",
                           device->name.c_str(), size / 1048576.0,
                           e_in_vram ? "VRAM" : "host/GTT", ggml_vk_vram_free_mib());
@@ -3791,8 +3791,8 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
     }
 
     {
-        static const bool traccia = getenv("GGML_VK_ALLOC_TRACE") != nullptr;
-        if (traccia && buf->size >= 64u * 1024 * 1024) {
+        static const bool do_trace = getenv("GGML_VK_ALLOC_TRACE") != nullptr;
+        if (do_trace && buf->size >= 64u * 1024 * 1024) {
             GGML_LOG_INFO("ggml_vulkan: FREE %.1f MiB, free vram before %.0f MiB\n",
                           buf->size / 1048576.0, ggml_vk_vram_free_mib());
         }
@@ -3835,16 +3835,16 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     // passes). The 4.8 us per barrier are not cache flushes decided by the masks,
     // they are pipeline drain. Narrowing does not help: the only lever left is to
     // emit FEWER of them.
-    static const int modo = [] {
+    static const int barrier_mode = [] {
         const char * e = getenv("GGML_VK_BARRIER_MODE");
         return e != nullptr ? atoi(e) : 0;
     }();
 
-    if (!transfer_queue && modo != 0) {
-        const vk::AccessFlags src = (modo == 2)
+    if (!transfer_queue && barrier_mode != 0) {
+        const vk::AccessFlags src = (barrier_mode == 2)
             ? vk::AccessFlags(vk::AccessFlagBits::eShaderWrite)
             : (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
-        const vk::AccessFlags dst = (modo == 2)
+        const vk::AccessFlags dst = (barrier_mode == 2)
             ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite)
             : (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
                vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
@@ -14654,12 +14654,12 @@ static void ggml_vk_sigmoid_mul_why(const struct ggml_cgraph * cgraph, int node_
     if (!dbg) {
         return;
     }
-    static int stampate = 0;
+    static int printed = 0;
     const ggml_tensor * un = cgraph->nodes[node_idx];
     if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID) {
         return;
     }
-    if (stampate++ > 400) {
+    if (printed++ > 400) {
         return;
     }
     const ggml_tensor * nx = (node_idx + 1 < cgraph->n_nodes) ? cgraph->nodes[node_idx + 1] : nullptr;
@@ -14668,20 +14668,20 @@ static void ggml_vk_sigmoid_mul_why(const struct ggml_cgraph * cgraph, int node_
             (long)un->ne[0], (long)un->ne[1], (long)un->ne[2], (long)un->ne[3],
             nx ? ggml_op_name(nx->op) : "-");
     if (strcmp(reason, "can_fuse") == 0) {
-        int dist = -1; const char * altro_op = "-";
+        int dist = -1; const char * other_op = "-";
         for (int k = node_idx + 1; k < std::min(node_idx + 40, cgraph->n_nodes); ++k) {
             const ggml_tensor * c = cgraph->nodes[k];
             if (c->op != GGML_OP_MUL) continue;
             if (c->src[0] != un && c->src[1] != un) continue;
             dist = k - node_idx;
-            altro_op = ggml_op_name((c->src[0] == un ? c->src[1] : c->src[0])->op);
+            other_op = ggml_op_name((c->src[0] == un ? c->src[1] : c->src[0])->op);
             break;
         }
-        fprintf(stderr, " mul_a_distanza=%d altro_op=%s", dist, altro_op);
+        fprintf(stderr, " mul_distance=%d other_op=%s", dist, other_op);
     }
     if (nx && nx->op == GGML_OP_MUL) {
         const ggml_tensor * x = (nx->src[0] == un) ? nx->src[1] : nx->src[0];
-        fprintf(stderr, " altro[%ld,%ld,%ld,%ld] usa_sig=%d cont=%d/%d",
+        fprintf(stderr, " other[%ld,%ld,%ld,%ld] uses_sig=%d cont=%d/%d",
                 (long)x->ne[0], (long)x->ne[1], (long)x->ne[2], (long)x->ne[3],
                 (nx->src[0] == un || nx->src[1] == un) ? 1 : 0,
                 ggml_is_contiguous(x), ggml_is_contiguous(nx));
@@ -14782,14 +14782,14 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
     // Enabled with GGML_VK_HC_DEBUG=1, and it only looks at sequences starting
     // with sigmoid followed by scale, that is the real candidates.
     static const bool dbg = getenv("GGML_VK_HC_DEBUG") != nullptr;
-    static int dbg_stampate = 0;
-    const bool candidata = dbg &&
+    static int dbg_printed = 0;
+    const bool candidate = dbg &&
         cgraph->nodes[node_idx]->op == GGML_OP_UNARY &&
         ggml_get_unary_op(cgraph->nodes[node_idx]) == GGML_UNARY_OP_SIGMOID &&
         node_idx + 4 < cgraph->n_nodes &&
         cgraph->nodes[node_idx + 1]->op == GGML_OP_SCALE;
 #define HC_NO(m) do { \
-        if (candidata && dbg_stampate++ < 60) { \
+        if (candidate && dbg_printed++ < 60) { \
             fprintf(stderr, "HC_NOFUSE %-12s ops=%s,%s,%s,%s,%s\n", (m), \
                 ggml_op_name(cgraph->nodes[node_idx + 0]->op), ggml_op_name(cgraph->nodes[node_idx + 1]->op), \
                 ggml_op_name(cgraph->nodes[node_idx + 2]->op), ggml_op_name(cgraph->nodes[node_idx + 3]->op), \
@@ -14862,7 +14862,7 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
         // replication must be along the stream dimension only
         const ggml_tensor * b = rep->src[0];
         if (a != rep) {
-            HC_NO("rep_non_usata");
+            HC_NO("rep_unused");
         }
         if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b)) {
             HC_NO("rep_tipo");
@@ -14877,8 +14877,8 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
 }
 
 static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
-    const bool con_rep = cgraph->nodes[node_idx]->op == GGML_OP_REPEAT;
-    const int  base    = con_rep ? node_idx + 1 : node_idx;
+    const bool with_rep = cgraph->nodes[node_idx]->op == GGML_OP_REPEAT;
+    const int  base    = with_rep ? node_idx + 1 : node_idx;
 
     const ggml_tensor * un  = cgraph->nodes[base + 0];
     const ggml_tensor * sc  = cgraph->nodes[base + 1];
@@ -14886,7 +14886,7 @@ static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_
     ggml_tensor *       add = cgraph->nodes[base + 4];
 
     const ggml_tensor * g = un->src[0];
-    const ggml_tensor * a = con_rep ? mul->src[0]->src[0] : mul->src[0];
+    const ggml_tensor * a = with_rep ? mul->src[0]->src[0] : mul->src[0];
     const ggml_tensor * c = add->src[0];
 
     vk_pipeline pipeline = ctx->device->pipeline_hc_combine_f32;
@@ -14904,7 +14904,7 @@ static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_
     pc.n   = static_cast<uint32_t>(ggml_nelements(add));
     pc.ne0 = static_cast<uint32_t>(add->ne[0]);
     // ne1 == 1 tells the shader that data_a already has the output shape
-    pc.ne1 = con_rep ? static_cast<uint32_t>(add->ne[1]) : 1u;
+    pc.ne1 = with_rep ? static_cast<uint32_t>(add->ne[1]) : 1u;
     pc.s   = sp[0];
 
     std::array<uint32_t, 3> elements = { pc.n, 1, 1 };
@@ -18429,7 +18429,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         return !(e != nullptr && atoi(e) != 0);
     }();
 
-    auto const &pronto = [&](const ggml_tensor * t) -> bool {
+    auto const &is_ready = [&](const ggml_tensor * t) -> bool {
         const ggml_tensor * cur = t;
         for (int guard = 0; guard < 8 && cur != nullptr; ++guard) {
             if (cur->op == GGML_OP_NONE) {
@@ -18512,11 +18512,11 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (!hc_off && match_pattern(hc_combine_pattern_orig, first_unused) &&
             graph->nodes[first_unused + 6]->ne[2] == 1) {
             const int i0 = first_unused;
-            const int ordine[7] = { i0 + 1, i0 + 0, i0 + 2, i0 + 3, i0 + 4, i0 + 5, i0 + 6 };
+            const int reorder_idx[7] = { i0 + 1, i0 + 0, i0 + 2, i0 + 3, i0 + 4, i0 + 5, i0 + 6 };
             for (int k = 0; k < 7; ++k) {
-                new_order.push_back(graph->nodes[ordine[k]]);
-                used_node_set.insert(graph->nodes[ordine[k]]);
-                used[ordine[k]] = true;
+                new_order.push_back(graph->nodes[reorder_idx[k]]);
+                used_node_set.insert(graph->nodes[reorder_idx[k]]);
+                used[reorder_idx[k]] = true;
             }
             while (first_unused < graph->n_nodes && used[first_unused]) {
                 first_unused++;
@@ -18552,14 +18552,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     continue;
                 }
                 ggml_tensor * m = graph->nodes[k];
-                ggml_tensor * altro = (m->src[0] == graph->nodes[first_unused]) ? m->src[1]
+                ggml_tensor * alt_src = (m->src[0] == graph->nodes[first_unused]) ? m->src[1]
                                     : (m->src[1] == graph->nodes[first_unused]) ? m->src[0] : nullptr;
-                if (altro == nullptr) {
+                if (alt_src == nullptr) {
                     continue;
                 }
                 // the other input must already be ready: a weight, an emitted node,
                 // or a view of one of those (views execute nothing)
-                if (!pronto(altro)) {
+                if (!is_ready(alt_src)) {
                     break;
                 }
                 // do not steal the MUL from another fusion that needs it adjacent
@@ -18730,14 +18730,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                             continue;
                         }
                         ggml_tensor * m = graph->nodes[k];
-                        ggml_tensor * altro = (m->src[0] == graph->nodes[j]) ? m->src[1]
+                        ggml_tensor * alt_src = (m->src[0] == graph->nodes[j]) ? m->src[1]
                                             : (m->src[1] == graph->nodes[j]) ? m->src[0] : nullptr;
-                        if (altro == nullptr) {
+                        if (alt_src == nullptr) {
                             continue;
                         }
                         // the other input must already be ready: a weight, an emitted node,
                         // or a view of one of those (views execute nothing)
-                        if (!pronto(altro)) {
+                        if (!is_ready(alt_src)) {
                             break;
                         }
                         // do not steal the MUL from another fusion that needs it adjacent

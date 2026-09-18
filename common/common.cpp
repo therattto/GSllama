@@ -1728,8 +1728,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // environment does not touch it; a value not below the full context is
     // ignored.
     if (params.n_kv_reserve == 0) {
-        const char * nkv_amb = getenv("LLAMA_ARG_CTX_SIZE_RESERVE");
-        const int nkv_val = nkv_amb != nullptr ? atoi(nkv_amb) : 0;
+        const char * nkv_env = getenv("LLAMA_ARG_CTX_SIZE_RESERVE");
+        const int nkv_val = nkv_env != nullptr ? atoi(nkv_env) : 0;
         if (nkv_val > 0 && (uint32_t)nkv_val < cparams.n_ctx) {
             cparams.n_kv_reserve = (uint32_t)nkv_val;
         }
