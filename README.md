@@ -79,9 +79,12 @@ and is the part intended for upstream.
   what decides whether a configuration loads at all. Adding a separate
   compute-window argument made a 200k-context setup fit where it previously
   did not.
-- **`ggml-cuda`: key the CUDA graph cache by shape.** Plus counters for graph
-  optimization forks (total / rescued / skipped). In three and a half hours of
-  production this fork reports **72,817 graph reuses and zero reallocations**.
+- **`ggml-cuda`: keep the parallel-fork events per split.** Upstream reset the
+  event map on every split, and on a two-backend machine the decode graph has 51
+  alternating splits, so the fork survived only in the last CUDA split. With
+  counters and an execution signature, so it is visible whether forks happen at
+  all. In three and a half hours of production this fork reports **72,817 graph
+  reuses and zero reallocations**.
 - **`ggml-backend`: count graph reallocations instead of aborting.** Sixteen
   lines. An abort tells you it happened once; a counter tells you how often,
   which is the number you actually need.
@@ -134,7 +137,10 @@ and is the part intended for upstream.
 - **`src/models/qwen4exp.cpp` is not our work.** It was written by **Daniel
   Han** (Unsloth) and added upstream on 27 August 2026, 1728 lines. Everything
   we did to that file is optimization on top of an architecture that already
-  worked.
+  worked. Several commits in this branch are his and not ours, including the
+  CUDA graph cache keyed by shape and the MTP draft-head loading. `git log`
+  shows the author of every commit; where it does not say `therattto`, it is
+  not ours.
 - Everything else in llama.cpp belongs to its authors. This fork adds patches,
   it does not claim the project.
 
