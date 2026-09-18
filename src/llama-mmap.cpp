@@ -8,6 +8,7 @@
 #include <climits>
 #include <stdexcept>
 #include <cerrno>
+#include <cstdlib>
 #include <algorithm>
 
 #ifdef __has_include
@@ -501,6 +502,24 @@ struct llama_mmap::impl {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
+#ifdef __linux__
+        // LLAMA_MMAP_READAHEAD: unset or 0 = original behaviour (the SEQUENTIAL
+        // hint stays on the fd for the whole life of the process). 1 = after the
+        // prefetch the fd goes back to POSIX_FADV_NORMAL, 2 = POSIX_FADV_RANDOM.
+        // Off by default, because this same binary is what users run for real work.
+        const char * e_ra = getenv("LLAMA_MMAP_READAHEAD");
+        const int        ra = e_ra != nullptr ? atoi(e_ra) : 0;
+        if (ra != 0) {
+            const int advice = ra >= 2 ? POSIX_FADV_RANDOM : POSIX_FADV_NORMAL;
+            if (posix_fadvise(fd, 0, 0, advice)) {
+                LLAMA_LOG_WARN("mmap: weight readahead: posix_fadvise(%s) failed: %s\n",
+                        advice == POSIX_FADV_RANDOM ? "RANDOM" : "NORMAL", strerror(errno));
+            } else {
+                LLAMA_LOG_WARN("mmap: weight readahead set to %s after prefetch (LLAMA_MMAP_READAHEAD=%d, fd=%d)\n",
+                        advice == POSIX_FADV_RANDOM ? "RANDOM" : "NORMAL", ra, fd);
+            }
+        }
+#endif
         for (const auto & range : lazy_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
