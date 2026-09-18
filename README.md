@@ -93,8 +93,7 @@ and is the part intended for upstream.
   copied across the PCIe boundary every step.
 - **`ggml-cuda`: wait for VRAM instead of failing.** `GGML_CUDA_WAIT_MEM_MS`.
   A process that has just exited does not return its VRAM immediately, and the
-  resulting OOM blames the wrong thing. See the notes repo, this one cost a
-  full session to diagnose.
+  resulting OOM blames the wrong thing, which cost a full session to diagnose.
 
 ### Vulkan, on AMD
 
@@ -102,8 +101,16 @@ and is the part intended for upstream.
   the two shaders. On the 7900 XTX the cost is dominated by *dispatches*, not
   arithmetic. Profiling showed 827 GPU pipeline flushes per token at roughly
   4.8 us each, while the host side accounted for only 9.7% of the time.
-  Folding operations together removed 104 ops in one change and 68 barriers in
-  another, for a few percent of decode each.
+
+  The two results are worth separating, because only one of them worked.
+  Folding the three `1/hc` scales into the norm gamma removed 104 operations
+  and is worth **+2.8% decode**; it is on by default. `hc_combine` removes 132
+  dispatches, 68 barriers, and **12.5% of the card's GPU time**, and the token
+  rate does not move at all (+0.3%, inside the noise) while prefill loses 2.5%
+  in three paired comparisons out of three. It is off by default, and it is the
+  more instructive of the two: on this card, taking measurable work away from
+  the GPU bought nothing, because that work was already overlapping with
+  something else.
 
 ### Qwen3.8-Flash-Next specific
 
