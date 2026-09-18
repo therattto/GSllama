@@ -384,6 +384,29 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
+
+// Free VRAM in MiB according to the kernel, not according to Vulkan. Used by the
+// allocation trace: this is the side that actually decides where a buffer ends up.
+static double ggml_vk_vram_free_mib() {
+    static std::string dir;
+    if (dir.empty()) {
+        for (int i = 0; i < 8; i++) {
+            char c[128];
+            snprintf(c, sizeof(c), "/sys/class/drm/card%d/device/mem_info_vram_total", i);
+            FILE * f = fopen(c, "r");
+            if (f) { fclose(f); snprintf(c, sizeof(c), "/sys/class/drm/card%d/device/", i); dir = c; break; }
+        }
+        if (dir.empty()) { dir = "-"; }
+    }
+    if (dir == "-") { return -1.0; }
+    unsigned long long tot = 0, usa = 0;
+    FILE * f = fopen((dir + "mem_info_vram_total").c_str(), "r");
+    if (f) { if (fscanf(f, "%llu", &tot) != 1) { tot = 0; } fclose(f); }
+    f = fopen((dir + "mem_info_vram_used").c_str(), "r");
+    if (f) { if (fscanf(f, "%llu", &usa) != 1) { usa = 0; } fclose(f); }
+    if (tot == 0) { return -1.0; }
+    return (double)(tot - usa) / 1048576.0;
+}
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
@@ -657,6 +680,24 @@ static constexpr std::initializer_list<ggml_op> snake_pattern              { GGM
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
 
+// Sigmoid gate: d = b * sigmoid(a). This is the most frequent pattern in this
+// model, every sigmoid feeds a mul, and on a backend that pays per dispatch a
+// fused pair is worth one operation less per occurrence.
+static constexpr std::initializer_list<ggml_op> sigmoid_mul_pattern         { GGML_OP_UNARY,    GGML_OP_MUL };
+
+// The hyper-connection recombination, build_hc_combine in qwen4exp.cpp:
+//   cur = residual + repeat(block) * 2*sigmoid(inject)
+// which in the graph is five consecutive nodes, the reshape included. It occurs
+// twice per layer, attention and FFN, and the chain is tight: four barriers in a
+// row on small tensors, that is almost pure dispatch cost.
+static constexpr std::initializer_list<ggml_op> hc_combine_pattern          { GGML_OP_UNARY,    GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD };
+// The same chain with the repeat in front. In the original order the inject
+// MUL_MAT sits between the two, but it is independent of both: the reordering
+// moves it ahead, see hc_pattern_lungo_originale below.
+static constexpr std::initializer_list<ggml_op> hc_combine_pattern_rep      { GGML_OP_REPEAT, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD };
+// as it appears in the graph before the reordering
+static constexpr std::initializer_list<ggml_op> hc_combine_pattern_orig     { GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD };
+
 //node #978 (  SOFT_MAX):     ffn_moe_probs-15 (   0K) [Vulka         ] use=2:    ffn_moe_logits-15 (   0K) [Vulka         ]
 //node #979 (   RESHAPE): ffn_moe_probs-15 (re (   0K) [Vulka         ] use=1:     ffn_moe_probs-15 (   0K) [Vulka         ]
 //node #980 (   ARGSORT):   ffn_moe_argsort-15 (   0K) [Vulka         ] use=1:     ffn_moe_probs-15 (   0K) [Vulka         ]
@@ -843,6 +884,9 @@ struct vk_device_struct {
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
+
+    // LARGE workgroups on AMD too for small-m mat-vecs, on by default
+    bool dmmv_large_amd;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -1076,6 +1120,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
+    vk_pipeline pipeline_sigmoid_mul_f32;
+    vk_pipeline pipeline_hc_combine_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
@@ -1825,6 +1871,17 @@ struct vk_op_conv_transpose_1d_push_constants {
     uint32_t nb1;
 
     int32_t s0;
+};
+
+struct vk_op_sigmoid_mul_push_constants {
+    uint32_t n;
+};
+
+struct vk_op_hc_combine_push_constants {
+    uint32_t n;
+    uint32_t ne0;
+    uint32_t ne1;
+    float    s;
 };
 
 struct vk_op_snake_push_constants {
@@ -3549,6 +3606,53 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         } catch (const vk::SystemError& e) {
         }
     } else {
+        // Wait until the kernel has actually handed back the VRAM just freed.
+        // On this machine the worst-case graph reserve, 8.06 GiB, is released and
+        // sixty milliseconds later the real compute buffer is allocated, 1621 MiB
+        // in two pieces. The memory has not come back yet, though: the first
+        // piece, 1021.8 MiB, is born in GTT and stays there for the whole life of
+        // the process, and while it does prefill runs at half speed and decode at
+        // three quarters. Only a prompt above 18000 tokens, which grows the buffer
+        // and therefore forces a reallocation, brings it back into VRAM. Here we
+        // sample the free VRAM according to the kernel and wait while it grows, at
+        // most GGML_VK_WAIT_VRAM_MS (0 turns it off). If after the wait it is
+        // still not enough we allocate anyway, exactly as before.
+        {
+            static const int max_ms = [] {
+                const char * e = getenv("GGML_VK_WAIT_VRAM_MS");
+                return e != nullptr ? atoi(e) : 3000;
+            }();
+            const bool vuole_vram = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
+            if (max_ms > 0 && vuole_vram && size >= 256u * 1024 * 1024) {
+                const double needed  = size / 1048576.0 + 128.0;
+                double free_mib = ggml_vk_vram_free_mib();
+                if (free_mib >= 0.0 && free_mib < needed) {
+                    // Waiting until the arithmetic works out is not enough: the
+                    // hand-back is still in progress, and allocating at the first
+                    // usable instant leaves a margin of a few tens of MiB. We wait
+                    // until the free VRAM stops growing, or until there is a
+                    // gigabyte more than needed.
+                    const double initial = free_mib;
+                    const double enough = needed + 1024.0;
+                    double prev = free_mib;
+                    int fermi = 0, waited = 0;
+                    while (waited < max_ms && free_mib < enough) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                        waited += 20;
+                        free_mib = ggml_vk_vram_free_mib();
+                        if (free_mib <= prev + 1.0) {
+                            if (++fermi >= 3) { break; }
+                        } else {
+                            fermi = 0;
+                        }
+                        prev = free_mib;
+                    }
+                    GGML_LOG_INFO("ggml_vulkan: %s: waited for VRAM for a %.1f MiB buffer: %d ms, free went from %.0f to %.0f MiB\n",
+                                  device->name.c_str(), size / 1048576.0, waited, initial, free_mib);
+                }
+            }
+        }
+
         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
             const auto & req_flags = *it;
 
@@ -3585,6 +3689,26 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     if (!buf->device_memory) {
         device->device.destroyBuffer(buf->buffer);
         throw vk::OutOfDeviceMemoryError("No suitable memory type found");
+    }
+
+    // What ends up outside VRAM, and how big it is. The fallback in this loop is
+    // silent: if device-local memory is not enough the allocation goes to host
+    // memory, that is GTT, and nothing says so. On this machine a buffer of about
+    // 1 GiB lands there on every startup and costs half the prefill until amdgpu
+    // migrates it on its own, which only happens with an 18000-token prompt.
+    // GGML_VK_ALLOC_TRACE=1 also prints successful allocations above 64 MiB.
+    {
+        static const bool traccia = getenv("GGML_VK_ALLOC_TRACE") != nullptr;
+        const bool voleva_vram = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
+        const bool e_in_vram = (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal) ? true : false;
+        if (voleva_vram && !e_in_vram) {
+            GGML_LOG_WARN("ggml_vulkan: %s: %.1f MiB buffer allocated OUTSIDE VRAM (host/GTT)\n",
+                          device->name.c_str(), size / 1048576.0);
+        } else if (traccia && size >= 64u * 1024 * 1024) {
+            GGML_LOG_INFO("ggml_vulkan: %s: ALLOC %.1f MiB, type %s, free vram after %.0f MiB\n",
+                          device->name.c_str(), size / 1048576.0,
+                          e_in_vram ? "VRAM" : "host/GTT", ggml_vk_vram_free_mib());
+        }
     }
 
     buf->ptr = nullptr;
@@ -3666,6 +3790,14 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
         return;
     }
 
+    {
+        static const bool traccia = getenv("GGML_VK_ALLOC_TRACE") != nullptr;
+        if (traccia && buf->size >= 64u * 1024 * 1024) {
+            GGML_LOG_INFO("ggml_vulkan: FREE %.1f MiB, free vram before %.0f MiB\n",
+                          buf->size / 1048576.0, ggml_vk_vram_free_mib());
+        }
+    }
+
     if (buf->device != nullptr) {
         buf->device->memory_logger->log_deallocation(buf);
     }
@@ -3684,6 +3816,42 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
 
     if (ctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    }
+
+    // How wide to request the barrier. Measured: the Vulkan decode split emits
+    // 827 of them per token, at 4.8 us each, that is 3.9 ms, one third of the
+    // 7900 XTX time. The masks below are the widest possible, and this knob is
+    // there to see how much of that cost depends on the width rather than on the
+    // pipeline flush itself.
+    //   0 (default) widest, the historical behaviour
+    //   1 source with writes only. Correct per spec: only writes need to be made
+    //     available, the read bits in srcAccessMask are not required.
+    //   2 shader only, no transfer. FOR MEASUREMENT ONLY, not shippable: in
+    //     decode the copies do exist (0.2 ms per graph) and this mask leaves them
+    //     uncovered.
+    // OUTCOME, measured: NEGATIVE. GPU time per graph 11.614 / 11.612 / 11.568 ms
+    // in the three modes, that is 0.4% between the widest and a mask that is not
+    // even correct, with the barrier groups stuck at 827 in all three (the check
+    // passes). The 4.8 us per barrier are not cache flushes decided by the masks,
+    // they are pipeline drain. Narrowing does not help: the only lever left is to
+    // emit FEWER of them.
+    static const int modo = [] {
+        const char * e = getenv("GGML_VK_BARRIER_MODE");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+
+    if (!transfer_queue && modo != 0) {
+        const vk::AccessFlags src = (modo == 2)
+            ? vk::AccessFlags(vk::AccessFlagBits::eShaderWrite)
+            : (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+        const vk::AccessFlags dst = (modo == 2)
+            ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite)
+            : (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+               vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+        subctx->s->buffer->buf.pipelineBarrier(
+            subctx->p->q->stage_flags, subctx->p->q->stage_flags, {},
+            { { { src }, { dst } } }, {}, {});
+        return;
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
@@ -5246,11 +5414,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // mul mat vec
 
     // the number of rows computed per shader depends on GPU model and quant
+    // Multiplier for the rows per workgroup of the dequant mul_mat_vec shaders.
+    // UNSET means 1, which is the previous behaviour character for character.
+    // Accepted values are 1 (a no-op), 2 and 4, because the fixed per-workgroup
+    // cost is then paid half or a quarter as often; out-of-range values are
+    // ignored with a WARN. 1 is accepted silently, because the benchmark's
+    // reference arm sets it by hand and must leave no trace in the log.
+    uint32_t rm_mul = 1;
+    {
+        const char * e_rm = getenv("GGML_VK_DMMV_RM");
+        if (e_rm != nullptr) {
+            const int v_rm = atoi(e_rm);
+            if (v_rm == 1 || v_rm == 2 || v_rm == 4) {
+                rm_mul = (uint32_t) v_rm;
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: GGML_VK_DMMV_RM='%s' ignorato, ammessi 1, 2, 4\n", e_rm);
+            }
+        }
+    }
     uint32_t rm_stdq = 1;
     uint32_t rm_kq = 2;
     uint32_t rm_stdq_int = 1;
     uint32_t rm_kq_int = 1;
-    auto const &rm_iq_int = [](uint32_t i) { return i == 0 ? 8u : 4u; };
+    auto const &rm_iq_int = [rm_mul](uint32_t i) { return (i == 0 ? 8u : 4u) * rm_mul; };
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         if (device->architecture == AMD_GCN) {
             rm_stdq = 2;
@@ -5262,6 +5448,46 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq_int = 2;
     }
     uint32_t rm_iq = 2 * rm_kq;
+    // The multiplier applies to the current values, including those of the
+    // AMD_GCN branch, which is never taken on this machine. rm_iq has already been
+    // computed from the unmultiplied rm_kq, so the factor is not applied twice.
+    rm_stdq     *= rm_mul;
+    rm_kq       *= rm_mul;
+    rm_stdq_int *= rm_mul;
+    rm_kq_int   *= rm_mul;
+    rm_iq       *= rm_mul;
+
+    // GGML_VK_DMMV_RM is ONE multiplier for five families that start from
+    // different values on this card: stdq 1, kq 2, iq 4 (plus iq_int 8/4).
+    // Doubling everything takes iq to 8 and iq_int to 16, and at RM=4 iq reaches
+    // 16: the benchmark indeed gave +1.95% at RM=2 and -3.28% at RM=4, that is,
+    // the single multiplier blunts the family that has headroom (stdq, starting
+    // at 1) in order not to overshoot the one that has none (iq, starting at 4).
+    // These variables set the ABSOLUTE value of one family and win over the
+    // multiplier. Unset, the behaviour is identical to the reference.
+    {
+        struct { const char * name; uint32_t * target; } fam[] = {
+            { "GGML_VK_DMMV_RM_STDQ",     &rm_stdq     },
+            { "GGML_VK_DMMV_RM_KQ",       &rm_kq       },
+            { "GGML_VK_DMMV_RM_IQ",       &rm_iq       },
+            { "GGML_VK_DMMV_RM_STDQ_INT", &rm_stdq_int },
+            { "GGML_VK_DMMV_RM_KQ_INT",   &rm_kq_int   },
+        };
+        for (auto & f : fam) {
+            const char * e = getenv(f.name);
+            if (e == nullptr) {
+                continue;
+            }
+            const int v = atoi(e);
+            if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) {
+                *f.target = (uint32_t) v;
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: %s='%s' ignorato, ammessi 1, 2, 4, 8, 16\n", f.name, e);
+            }
+        }
+    }
+    GGML_LOG_INFO("ggml_vulkan: %s: GGML_VK_DMMV_RM=%u, rows per workgroup: stdq %u, kq %u, iq %u, stdq_int %u, kq_int %u, iq_int %u/%u\n",
+                  __func__, rm_mul, rm_stdq, rm_kq, rm_iq, rm_stdq_int, rm_kq_int, rm_iq_int(0), rm_iq_int(1));
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // Ensure a subgroup size >= 16 is available
@@ -5889,6 +6115,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_sigmoid_mul_f32, "sigmoid_mul_f32", sigmoid_mul_f32_len, sigmoid_mul_f32_data, "main", 3, sizeof(vk_op_sigmoid_mul_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_hc_combine_f32, "hc_combine_f32", hc_combine_f32_len, hc_combine_f32_data, "main", 4, sizeof(vk_op_hc_combine_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -6345,7 +6573,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
             } else if (strcmp("VK_KHR_pipeline_executable_properties", properties.extensionName) == 0) {
                 pipeline_executable_properties_support = true;
             } else if (strcmp("VK_EXT_memory_priority", properties.extensionName) == 0 &&
-                       getenv("GGML_VK_ENABLE_MEMORY_PRIORITY")) {
+                       // Off-by-default idiom. It used to be true by PRESENCE,
+                       // so setting it to "0" turned it ON: a benchmark's
+                       // reference arm would have enabled it together with the
+                       // treatment, making the two arms differ in two things at
+                       // once. With atoi() the variable becomes measurable. Unset,
+                       // it behaves as before, that is off.
+                       [] { const char * e = getenv("GGML_VK_ENABLE_MEMORY_PRIORITY");
+                            return e != nullptr && atoi(e) != 0; }()) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
@@ -7165,6 +7400,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
+        // LARGE workgroups on AMD too for small-m mat-vecs, on by default
+        const char * e_amd = getenv("GGML_VK_DMMV_LARGE_AMD");
+        device->dmmv_large_amd = (e_amd == nullptr) || (atoi(e_amd) != 0);
+
         return device;
     }
 
@@ -7901,7 +8140,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+    const bool prefer_large = (ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) ||
+                              ctx->device->vendor_id == VK_VENDOR_ID_INTEL ||
+                              (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->dmmv_large_amd);
+    if (prefer_large) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
@@ -8068,7 +8310,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+    const bool prefer_large = (ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) ||
+                              ctx->device->vendor_id == VK_VENDOR_ID_INTEL ||
+                              (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->dmmv_large_amd);
+    if (prefer_large) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
@@ -14399,6 +14644,273 @@ static void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_COL2IM_1D, std::move(p));
 }
 
+// Diagnostics: why this sigmoid does not fuse. Enabled with
+// GGML_VK_SIGMOID_MUL_DEBUG=1, prints at most 400 lines, that is a few graphs.
+static void ggml_vk_sigmoid_mul_why(const struct ggml_cgraph * cgraph, int node_idx, const char * reason) {
+    static const bool dbg = [] {
+        const char * e = getenv("GGML_VK_SIGMOID_MUL_DEBUG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!dbg) {
+        return;
+    }
+    static int stampate = 0;
+    const ggml_tensor * un = cgraph->nodes[node_idx];
+    if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID) {
+        return;
+    }
+    if (stampate++ > 400) {
+        return;
+    }
+    const ggml_tensor * nx = (node_idx + 1 < cgraph->n_nodes) ? cgraph->nodes[node_idx + 1] : nullptr;
+    fprintf(stderr, "SIGMOID_NOFUSE %-28s reason=%-10s sig[%ld,%ld,%ld,%ld] after=%s",
+            un->name, reason,
+            (long)un->ne[0], (long)un->ne[1], (long)un->ne[2], (long)un->ne[3],
+            nx ? ggml_op_name(nx->op) : "-");
+    if (strcmp(reason, "can_fuse") == 0) {
+        int dist = -1; const char * altro_op = "-";
+        for (int k = node_idx + 1; k < std::min(node_idx + 40, cgraph->n_nodes); ++k) {
+            const ggml_tensor * c = cgraph->nodes[k];
+            if (c->op != GGML_OP_MUL) continue;
+            if (c->src[0] != un && c->src[1] != un) continue;
+            dist = k - node_idx;
+            altro_op = ggml_op_name((c->src[0] == un ? c->src[1] : c->src[0])->op);
+            break;
+        }
+        fprintf(stderr, " mul_a_distanza=%d altro_op=%s", dist, altro_op);
+    }
+    if (nx && nx->op == GGML_OP_MUL) {
+        const ggml_tensor * x = (nx->src[0] == un) ? nx->src[1] : nx->src[0];
+        fprintf(stderr, " altro[%ld,%ld,%ld,%ld] usa_sig=%d cont=%d/%d",
+                (long)x->ne[0], (long)x->ne[1], (long)x->ne[2], (long)x->ne[3],
+                (nx->src[0] == un || nx->src[1] == un) ? 1 : 0,
+                ggml_is_contiguous(x), ggml_is_contiguous(nx));
+    }
+    fprintf(stderr, "\n");
+}
+
+// Only valid for identical contiguous f32 shapes: the shader indexes flat.
+static bool ggml_vk_can_fuse_sigmoid_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(ctx);
+    // the value matters here: =1 disables, =0 or unset leave it enabled. The rest
+    // of this backend uses "getenv() != nullptr", that is the opposite idiom, and
+    // in this project that difference has already caused two different graphs to
+    // be measured as if they were one.
+    static const bool disabled = [] {
+        const char * e = getenv("GGML_VK_DISABLE_SIGMOID_MUL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (disabled) {
+        return false;
+    }
+    if (!ggml_can_fuse(cgraph, node_idx, sigmoid_mul_pattern)) {
+        ggml_vk_sigmoid_mul_why(cgraph, node_idx, "can_fuse");
+        return false;
+    }
+
+    const ggml_tensor * un  = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID) {
+        ggml_vk_sigmoid_mul_why(cgraph, node_idx, "not_sigmoid");
+        return false;
+    }
+    if (mul->src[0] != un && mul->src[1] != un) {
+        ggml_vk_sigmoid_mul_why(cgraph, node_idx, "src");
+        return false;
+    }
+
+    const ggml_tensor * x = (mul->src[0] == un) ? mul->src[1] : mul->src[0];
+    const ggml_tensor * g = un->src[0];
+
+    if (g->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        un->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        ggml_vk_sigmoid_mul_why(cgraph, node_idx, "type");
+        return false;
+    }
+    if (!ggml_are_same_shape(g, x) || !ggml_are_same_shape(g, mul)) {
+        ggml_vk_sigmoid_mul_why(cgraph, node_idx, "shape");
+        return false;
+    }
+    if (!ggml_is_contiguous(g) || !ggml_is_contiguous(x) || !ggml_is_contiguous(mul)) {
+        ggml_vk_sigmoid_mul_why(cgraph, node_idx, "contig");
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_sigmoid_mul_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * un  = cgraph->nodes[node_idx + 0];
+    ggml_tensor *       mul = cgraph->nodes[node_idx + 1];
+
+    const ggml_tensor * x = (mul->src[0] == un) ? mul->src[1] : mul->src[0];
+    const ggml_tensor * g = un->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_sigmoid_mul_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx, g);
+    vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, mul);
+
+    vk_op_sigmoid_mul_push_constants pc{};
+    pc.n = static_cast<uint32_t>(ggml_nelements(mul));
+
+    std::array<uint32_t, 3> elements = { pc.n, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { g_buf, x_buf, d_buf }, pc, elements);
+}
+
+// Recognizes the sigmoid, scale, reshape, mul, add chain of build_hc_combine.
+// The checks are deliberately strict: the pattern is generic and elsewhere in the
+// graph the same sequence could have shapes the kernel cannot index.
+static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(ctx);
+    // OFF by default, and that is not an oversight: measured, it removes 132
+    // dispatches and 68 barriers per token and 12.5% of the XTX GPU time, and the
+    // token rate does not move (decode +0.3%, inside the noise), while prefill
+    // loses 2.5% in three paired comparisons out of three. Enable it with
+    // GGML_VK_HC_COMBINE=1. Unset means OFF, that is the opposite idiom to
+    // GGML_VK_DISABLE_SIGMOID_MUL: here the name says so.
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_HC_COMBINE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+    // Diagnostics: prints why a chain that looks like hc_combine does not fuse.
+    // Enabled with GGML_VK_HC_DEBUG=1, and it only looks at sequences starting
+    // with sigmoid followed by scale, that is the real candidates.
+    static const bool dbg = getenv("GGML_VK_HC_DEBUG") != nullptr;
+    static int dbg_stampate = 0;
+    const bool candidata = dbg &&
+        cgraph->nodes[node_idx]->op == GGML_OP_UNARY &&
+        ggml_get_unary_op(cgraph->nodes[node_idx]) == GGML_UNARY_OP_SIGMOID &&
+        node_idx + 4 < cgraph->n_nodes &&
+        cgraph->nodes[node_idx + 1]->op == GGML_OP_SCALE;
+#define HC_NO(m) do { \
+        if (candidata && dbg_stampate++ < 60) { \
+            fprintf(stderr, "HC_NOFUSE %-12s ops=%s,%s,%s,%s,%s\n", (m), \
+                ggml_op_name(cgraph->nodes[node_idx + 0]->op), ggml_op_name(cgraph->nodes[node_idx + 1]->op), \
+                ggml_op_name(cgraph->nodes[node_idx + 2]->op), ggml_op_name(cgraph->nodes[node_idx + 3]->op), \
+                ggml_op_name(cgraph->nodes[node_idx + 4]->op)); \
+        } \
+        return false; \
+    } while (0)
+
+    // two variants: with the repeat in front (the block is read unreplicated) and
+    // without (fallback, the block arrives already replicated from its own node)
+    const ggml_tensor * rep = nullptr;
+    int base = node_idx;
+    if (cgraph->nodes[node_idx]->op == GGML_OP_REPEAT) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, hc_combine_pattern_rep, { node_idx + 5 })) {
+            return false;
+        }
+        rep  = cgraph->nodes[node_idx];
+        base = node_idx + 1;
+    } else if (!ggml_can_fuse_subgraph(cgraph, node_idx, hc_combine_pattern, { node_idx + 4 })) {
+        HC_NO("can_fuse");
+    }
+
+    const ggml_tensor * un  = cgraph->nodes[base + 0];
+    const ggml_tensor * sc  = cgraph->nodes[base + 1];
+    const ggml_tensor * rs  = cgraph->nodes[base + 2];
+    const ggml_tensor * mul = cgraph->nodes[base + 3];
+    const ggml_tensor * add = cgraph->nodes[base + 4];
+
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID) {
+        HC_NO("not_sigmoid");
+    }
+    // ggml_scale carries scale and bias in its params: the bias must be zero here
+    float sp[2] = { 0.0f, 0.0f };
+    memcpy(sp, sc->op_params, sizeof(sp));
+    if (sp[1] != 0.0f) {
+        HC_NO("bias");
+    }
+    if (sc->src[0] != un || rs->src[0] != sc) {
+        HC_NO("chain");
+    }
+    if (mul->src[1] != rs) {
+        HC_NO("mul_src");
+    }
+    if (add->src[1] != mul) {
+        HC_NO("add_src");
+    }
+
+    const ggml_tensor * g = un->src[0];   // il gate prima del sigmoid
+    const ggml_tensor * a = mul->src[0];  // the already repeated block
+    const ggml_tensor * c = add->src[0];  // il residuo
+
+    if (g->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
+        c->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+        HC_NO("type");
+    }
+    if (!ggml_are_same_shape(a, mul) || !ggml_are_same_shape(a, c) || !ggml_are_same_shape(a, add)) {
+        HC_NO("forma");
+    }
+    if (!ggml_is_contiguous(g) || !ggml_is_contiguous(a) ||
+        !ggml_is_contiguous(c) || !ggml_is_contiguous(add)) {
+        HC_NO("contig");
+    }
+    // the gate has one value per row of a, and the reshape puts it at [1, ...]:
+    // that is the only indexing the kernel knows how to do
+    if (rs->ne[0] != 1 || ggml_nelements(g) * a->ne[0] != ggml_nelements(a)) {
+        HC_NO("gate");
+    }
+    if (rep != nullptr) {
+        // the unreplicated block must be [ne0, 1, nt] contiguous, that is, the
+        // replication must be along the stream dimension only
+        const ggml_tensor * b = rep->src[0];
+        if (a != rep) {
+            HC_NO("rep_non_usata");
+        }
+        if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b)) {
+            HC_NO("rep_tipo");
+        }
+        if (b->ne[0] != a->ne[0] || b->ne[1] != 1 || b->ne[2] != a->ne[2] ||
+            b->ne[3] != 1 || a->ne[3] != 1 || a->ne[1] < 1) {
+            HC_NO("rep_forma");
+        }
+    }
+#undef HC_NO
+    return true;
+}
+
+static void ggml_vk_hc_combine_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const bool con_rep = cgraph->nodes[node_idx]->op == GGML_OP_REPEAT;
+    const int  base    = con_rep ? node_idx + 1 : node_idx;
+
+    const ggml_tensor * un  = cgraph->nodes[base + 0];
+    const ggml_tensor * sc  = cgraph->nodes[base + 1];
+    const ggml_tensor * mul = cgraph->nodes[base + 3];
+    ggml_tensor *       add = cgraph->nodes[base + 4];
+
+    const ggml_tensor * g = un->src[0];
+    const ggml_tensor * a = con_rep ? mul->src[0]->src[0] : mul->src[0];
+    const ggml_tensor * c = add->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_hc_combine_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, a);
+    vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx, g);
+    vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, c);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, add);
+
+    float sp[2] = { 0.0f, 0.0f };
+    memcpy(sp, sc->op_params, sizeof(sp));
+
+    vk_op_hc_combine_push_constants pc{};
+    pc.n   = static_cast<uint32_t>(ggml_nelements(add));
+    pc.ne0 = static_cast<uint32_t>(add->ne[0]);
+    // ne1 == 1 tells the shader that data_a already has the output shape
+    pc.ne1 = con_rep ? static_cast<uint32_t>(add->ne[1]) : 1u;
+    pc.s   = sp[0];
+
+    std::array<uint32_t, 3> elements = { pc.n, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, g_buf, c_buf, d_buf }, pc, elements);
+}
+
 // Dispatch the fused snake activation: y = x + sin^2(a * x) * inv_b.
 // Match the naive mul -> sin -> sqr -> mul -> add chain and run the
 // dedicated kernel directly. The pattern is validated by
@@ -15691,6 +16203,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     switch (node->op) {
     case GGML_OP_REPEAT:
+        if (ctx->num_additional_fused_ops == 5 &&
+            node_idx + 5 < cgraph->n_nodes &&
+            cgraph->nodes[node_idx + 5]->op == GGML_OP_ADD) {
+            ggml_vk_hc_combine_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
 
         break;
@@ -15845,6 +16363,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_UNARY:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+
+        if (ctx->num_additional_fused_ops == 4 &&
+            ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+            node_idx + 4 < cgraph->n_nodes &&
+            cgraph->nodes[node_idx + 4]->op == GGML_OP_ADD) {
+            ggml_vk_hc_combine_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+
+        if (ctx->num_additional_fused_ops == 1 &&
+            ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+            node_idx + 1 < cgraph->n_nodes &&
+            cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
+            ggml_vk_sigmoid_mul_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
 
@@ -17629,6 +18163,32 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_LATE_SOFTMAX;
                 fusion_string = "TOPK_MOE_LATE_SOFTMAX";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (cgraph->nodes[i]->op == GGML_OP_REPEAT && ggml_vk_can_fuse_hc_combine(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 5;
+                fusion_string = "HC_COMBINE_REP";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
+                op_srcs_fused_elementwise[3] = false;
+                op_srcs_fused_elementwise[4] = false;
+                op_srcs_fused_elementwise[5] = true;
+            } else if (ggml_vk_can_fuse_hc_combine(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 4;
+                fusion_string = "HC_COMBINE";
+                // only the residual may share memory with the output: thread idx
+                // reads it at the same position it writes to. The gate may not, it
+                // is read at idx/ne0.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
+                op_srcs_fused_elementwise[3] = false;
+                op_srcs_fused_elementwise[4] = true;
+            } else if (ggml_vk_can_fuse_sigmoid_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SIGMOID_MUL";
+                // every thread reads a[idx] and b[idx] and writes d[idx], so exact
+                // aliasing is safe
+                std::fill_n(op_srcs_fused_elementwise, 2, true);
             }
             if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
                 // Look for an additional scale op to fuse - occurs in deepseek2 and nemotron3 nano.
@@ -17845,6 +18405,47 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
+    // Pull forward the multiplication that consumes a sigmoid gate, to make it
+    // adjacent and therefore fusable. It is the same trick already used for
+    // RMS_NORM + MUL + ROPE and for SSM_CONV + ADD + UNARY. Without it, on
+    // Flash-Next only 35 sigmoids out of 115 fuse: all the others fail on
+    // adjacency alone, not on shape.
+    // Keeping the sigmoid plus multiplication pair together is OFF by default,
+    // and that is not an oversight: measured, it is worth 1700 fewer dispatches
+    // per 100 graphs and **zero** time, because the sigmoids the reordering
+    // separates cost 1.44 us each instead of 5.98, that is, they overlap with
+    // other operations and are already free. Enable it with
+    // GGML_VK_SIGMOID_MUL_PULL=1.
+    static const bool no_pull = [] {
+        const char * e = getenv("GGML_VK_SIGMOID_MUL_PULL");
+        return !(e != nullptr && atoi(e) != 0);
+    }();
+
+    // If the hc_combine fusion is off, the reordering must not be constrained:
+    // otherwise the reference arm is not the old behaviour.
+    // It is off by default, see ggml_vk_can_fuse_hc_combine.
+    static const bool hc_off = [] {
+        const char * e = getenv("GGML_VK_HC_COMBINE");
+        return !(e != nullptr && atoi(e) != 0);
+    }();
+
+    auto const &pronto = [&](const ggml_tensor * t) -> bool {
+        const ggml_tensor * cur = t;
+        for (int guard = 0; guard < 8 && cur != nullptr; ++guard) {
+            if (cur->op == GGML_OP_NONE) {
+                return true;
+            }
+            if (used_node_set.find(const_cast<ggml_tensor *>(cur)) != used_node_set.end()) {
+                return true;
+            }
+            if (!is_empty(cur)) {
+                return false;
+            }
+            cur = cur->view_src ? cur->view_src : cur->src[0];
+        }
+        return false;
+    };
+
     int first_unused = 0;
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
@@ -17896,9 +18497,82 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        // The build_hc_combine chain must be kept together: without this, the
+        // loop that pulls independent nodes forward slips a MUL_MAT between the
+        // scale and the reshape and the fusion never fires.
+        // The inject MUL_MAT sits between the repeat and the chain, and is
+        // independent of both: moving it ahead makes the repeat adjacent to the
+        // chain, so the kernel can read the block unreplicated, that is 33 fewer
+        // dispatches per token. The swap is legal, the sources of both have
+        // already been emitted.
+        // Decode only. In prefill the swap costs 2.9%, measured with two ABBA
+        // rounds: there the inject MUL_MAT is large and moving it ahead removes
+        // its overlap with the rest. The chain's ADD node has shape
+        // [n_embd, hc, nt], so ne[2] == 1 means a single token.
+        if (!hc_off && match_pattern(hc_combine_pattern_orig, first_unused) &&
+            graph->nodes[first_unused + 6]->ne[2] == 1) {
+            const int i0 = first_unused;
+            const int ordine[7] = { i0 + 1, i0 + 0, i0 + 2, i0 + 3, i0 + 4, i0 + 5, i0 + 6 };
+            for (int k = 0; k < 7; ++k) {
+                new_order.push_back(graph->nodes[ordine[k]]);
+                used_node_set.insert(graph->nodes[ordine[k]]);
+                used[ordine[k]] = true;
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            continue;
+        }
+        if (!hc_off && keep_pattern(hc_combine_pattern)) {
+            continue;
+        }
+        // Do not separate an already adjacent SIGMOID + MUL pair. The reordering
+        // broke one third of them: without reordering the fusions are 5198 per
+        // 100 graphs, with reordering 3498. Turning the reordering off, however,
+        // costs more than it returns (135408 operations against 129112), so the
+        // pair is protected instead of giving up the pass.
+        if (!no_pull &&
+            match_pattern(sigmoid_mul_pattern, first_unused) &&
+            ggml_get_unary_op(graph->nodes[first_unused]) == GGML_UNARY_OP_SIGMOID &&
+            (graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused] ||
+             graph->nodes[first_unused + 1]->src[1] == graph->nodes[first_unused]) &&
+            keep_pattern(sigmoid_mul_pattern)) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
+
+        // UNARY(SIGMOID) + MUL: pull forward the mul that consumes the gate
+        if (!no_pull &&
+            graph->nodes[first_unused]->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(graph->nodes[first_unused]) == GGML_UNARY_OP_SIGMOID) {
+            for (int k = first_unused + 1; k < std::min(first_unused + 15, graph->n_nodes); ++k) {
+                if (used[k] || graph->nodes[k]->op != GGML_OP_MUL) {
+                    continue;
+                }
+                ggml_tensor * m = graph->nodes[k];
+                ggml_tensor * altro = (m->src[0] == graph->nodes[first_unused]) ? m->src[1]
+                                    : (m->src[1] == graph->nodes[first_unused]) ? m->src[0] : nullptr;
+                if (altro == nullptr) {
+                    continue;
+                }
+                // the other input must already be ready: a weight, an emitted node,
+                // or a view of one of those (views execute nothing)
+                if (!pronto(altro)) {
+                    break;
+                }
+                // do not steal the MUL from another fusion that needs it adjacent
+                if (k > 0 && (graph->nodes[k-1]->op == GGML_OP_RMS_NORM ||
+                              graph->nodes[k-1]->op == GGML_OP_MUL_MAT_ID ||
+                              graph->nodes[k-1]->op == GGML_OP_ADD_ID)) {
+                    break;
+                }
+                current_set.push_back(k);
+                used[k] = true;
+                break;
+            }
+        }
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -17906,7 +18580,15 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        // How many nodes to look ahead when filling the current group. Larger
+        // means potentially fewer barriers, and every barrier saved is worth
+        // 4.8 us on the 7900 XTX. It costs host time, which is only 9.7% of the
+        // split.
+        static const int NUM_TO_CHECK = [] {
+            const char * e = getenv("GGML_VK_REORDER_WINDOW");
+            const int v = e != nullptr ? atoi(e) : 0;
+            return v > 1 ? v : 20;
+        }();
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -17915,7 +18597,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 continue;
             }
             // Don't pull forward nodes from fusion patterns
-            if (match_pattern(topk_moe_early_softmax_norm, j) ||
+            if ((!hc_off && (match_pattern(hc_combine_pattern_orig, j) ||
+                             match_pattern(hc_combine_pattern, j))) ||
+                match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
@@ -17923,11 +18607,32 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(snake_pattern, j)) {
                 continue;
             }
+            // A SIGMOID + MUL pair must not be broken by pulling either half
+            // forward either: protecting only the anchor was not enough, because
+            // the sigmoid was being pulled in from an earlier set.
+            if (!no_pull) {
+                const bool sig_j = graph->nodes[j]->op == GGML_OP_UNARY &&
+                                   ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SIGMOID &&
+                                   j + 1 < graph->n_nodes && !used[j + 1] &&
+                                   graph->nodes[j + 1]->op == GGML_OP_MUL &&
+                                   (graph->nodes[j + 1]->src[0] == graph->nodes[j] ||
+                                    graph->nodes[j + 1]->src[1] == graph->nodes[j]);
+                const bool mul_j = graph->nodes[j]->op == GGML_OP_MUL &&
+                                   j > 0 && !used[j - 1] &&
+                                   graph->nodes[j - 1]->op == GGML_OP_UNARY &&
+                                   ggml_get_unary_op(graph->nodes[j - 1]) == GGML_UNARY_OP_SIGMOID &&
+                                   (graph->nodes[j]->src[0] == graph->nodes[j - 1] ||
+                                    graph->nodes[j]->src[1] == graph->nodes[j - 1]);
+                if (sig_j || mul_j) {
+                    continue;
+                }
+            }
             bool ok = true;
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
@@ -18014,6 +18719,36 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                             used[k] = true;
                             break;
                         }
+                    }
+                }
+                // UNARY(SIGMOID) + MUL: pull forward the mul that consumes the gate
+                if (!no_pull &&
+                    graph->nodes[j]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SIGMOID) {
+                    for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
+                        if (used[k] || graph->nodes[k]->op != GGML_OP_MUL) {
+                            continue;
+                        }
+                        ggml_tensor * m = graph->nodes[k];
+                        ggml_tensor * altro = (m->src[0] == graph->nodes[j]) ? m->src[1]
+                                            : (m->src[1] == graph->nodes[j]) ? m->src[0] : nullptr;
+                        if (altro == nullptr) {
+                            continue;
+                        }
+                        // the other input must already be ready: a weight, an emitted node,
+                        // or a view of one of those (views execute nothing)
+                        if (!pronto(altro)) {
+                            break;
+                        }
+                        // do not steal the MUL from another fusion that needs it adjacent
+                        if (k > 0 && (graph->nodes[k-1]->op == GGML_OP_RMS_NORM ||
+                                      graph->nodes[k-1]->op == GGML_OP_MUL_MAT_ID ||
+                                      graph->nodes[k-1]->op == GGML_OP_ADD_ID)) {
+                            break;
+                        }
+                        current_set.push_back(k);
+                        used[k] = true;
+                        break;
                     }
                 }
                 // SSM_CONV + ADD + UNARY: pull the consuming UNARY forward

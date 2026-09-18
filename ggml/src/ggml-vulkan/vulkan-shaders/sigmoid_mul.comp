@@ -1,0 +1,28 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused sigmoid gate: d = b * sigmoid(a)
+//   data_a [n]   the gate pre-activation
+//   data_b [n]   the tensor being multiplied
+//   data_d [n]   output
+// All three shapes are identical and contiguous, checked by
+// ggml_vk_can_fuse_sigmoid_mul.
+layout (binding = 0) readonly  buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly  buffer B {A_TYPE data_b[];};
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t n;
+} p;
+
+void main() {
+    const uint32_t idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) return;
+
+    const float g = float(data_a[idx]);
+    const float x = float(data_b[idx]);
+    data_d[idx] = D_TYPE(x / (1.0 + exp(-g)));
+}

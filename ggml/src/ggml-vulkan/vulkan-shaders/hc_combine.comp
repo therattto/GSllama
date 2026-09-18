@@ -1,0 +1,45 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused hyper-connection recombination:
+//   d[e,h,t] = c[e,h,t] + a[e,t] * (s / (1 + exp(-g[h,t])))
+// that is, the repeat, sigmoid, scale, reshape, mul, add chain of
+// build_hc_combine. The block is read UNreplicated: the repeat only existed to
+// give ggml_mul two operands of the same shape, and here replication is just an
+// index.
+//   data_a [n / ne1]  the block, [ne0, nt]
+//   data_g [n / ne0]  the gate before the sigmoid, [ne1, nt]
+//   data_c [n]        the residual, [ne0, ne1, nt]
+//   data_d [n]        output
+// With REPLICA=0, data_a is already replicated and is indexed flat: that is the
+// fallback for when the repeat cannot be fused.
+// Shapes and contiguity are checked by ggml_vk_can_fuse_hc_combine.
+layout (binding = 0) readonly  buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly  buffer G {A_TYPE data_g[];};
+layout (binding = 2) readonly  buffer C {A_TYPE data_c[];};
+layout (binding = 3) writeonly buffer D {D_TYPE data_d[];};
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint32_t n;
+    uint32_t ne0;
+    uint32_t ne1;
+    float    s;
+} p;
+
+void main() {
+    const uint32_t idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) return;
+
+    const float g = float(data_g[idx / p.ne0]);
+    const float w = p.s / (1.0 + exp(-g));
+
+    // ne1 == 1 signals that data_a already has the output shape
+    const uint32_t ia = (p.ne1 == 1u)
+        ? idx
+        : (idx / (p.ne0 * p.ne1)) * p.ne0 + (idx % p.ne0);
+
+    data_d[idx] = D_TYPE(float(data_c[idx]) + float(data_a[ia]) * w);
+}
