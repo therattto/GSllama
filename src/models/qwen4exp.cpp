@@ -273,13 +273,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
+    // LLAMA_HC_FOLD_SCALE: the three 1/hc scales in this chain (before the silu,
+    // on the stream mean, and on inject inside build_hc_combine) are the same
+    // constant applied downstream of xn. Folding it once into the norm gamma,
+    // which is an hc_dim tensor rather than an activation, removes all three and
+    // leaves the numbers identical: the silu and the sigmoid still see the same
+    // value, and the sum of the four streams is already the mean.
+    // Turn it off with LLAMA_HC_FOLD_SCALE=0.
+    static const bool hc_fold_scale = [] {
+        const char * e = getenv("LLAMA_HC_FOLD_SCALE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    ggml_tensor * gamma = hc_fold_scale ? ggml_scale(ctx0, w_norm, 1.0f / (float) hc) : w_norm;
+    xn = ggml_mul(ctx0, xn, gamma);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    if (!hc_fold_scale) {
+        lo = ggml_scale(ctx0, lo, 1.0f / (float) hc);
+    }
+    lo = ggml_silu(ctx0, lo);
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
 
@@ -287,16 +303,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // collapse the streams by their mean
+    // LLAMA_HC_NO_CONT: the copy that made the first stream contiguous is not
+    // needed, because the first ggml_add already produces a new contiguous
+    // tensor. It is only kept when hc is 1, that is, when that first add is
+    // absent. ON by default, turn it off with LLAMA_HC_NO_CONT=0.
+    static const bool hc_no_cont = [] {
+        const char * e = getenv("LLAMA_HC_NO_CONT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
             ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
+    if (!hc_no_cont || hc == 1) {
+        mixed = ggml_cont(ctx0, mixed);
+    }
     for (int64_t c = 1; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
                 ggml_row_size(gated->type, n_embd) * c);
         mixed = ggml_add(ctx0, mixed, s);
     }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+    if (!hc_fold_scale) {
+        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+    }
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
@@ -316,7 +345,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+    static const bool hc_fold_scale_c = [] {
+        const char * e = getenv("LLAMA_HC_FOLD_SCALE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    ggml_tensor * w = hc_fold_scale_c
+        ? ggml_sigmoid(ctx0, inject)
+        : ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
@@ -790,6 +825,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     const bool blk_topk = blk_topk_env && blk_bias && n_stream == 1 && cparams.n_seq_max == 1;
 
+    // accumulate the indexer score one head at a time instead of building the whole
+    // [n_idx_h*n_tps, n_blocks] product and summing it with sum_rows. See below.
+    // ON by default, turn it off with LLAMA_QSA_HEAD_ACC=0
+    static const bool head_acc = [] {
+        const char * e = getenv("LLAMA_QSA_HEAD_ACC");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    // the single-row gate: the per-head branch exists so that the
+    // [n_idx_h*n_tps, n_blocks] intermediate is never built, since at large n_tps
+    // it is the biggest tensor in the graph. When n_tps is 1 (decode at batch 1)
+    // that intermediate is a few kB, and the per-head branch pays n_idx_h mul_mat
+    // where the other pays a single one. OFF by default, turn it on with
+    // LLAMA_QSA_HEAD_ACC_ROW=1: without the variable the graph is exactly the
+    // current one
+    static const bool head_acc_row = [] {
+        const char * e = getenv("LLAMA_QSA_HEAD_ACC_ROW");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -868,7 +923,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     ggml_tensor * score = nullptr;
 
-    if (blk_topk) {
+    if (blk_topk && head_acc && !(head_acc_row && n_tps == 1)) {
+        // One head at a time, accumulating. The score is sum_h relu(q_h . k_b), so the sum over
+        // heads can happen outside the rectifier: nothing changes in the numbers, and the
+        // [n_idx_h*n_tps, n_blocks] intermediate never exists. That tensor is the single
+        // largest node of the whole graph at long context: 4*1536 x 50176 in f32 is 1233 MiB
+        // at ctx 200704 with ub 1536, and sum_rows keeps it alive next to its own 294 MiB
+        // output. Per head the live set is the accumulator plus one term, 294 MiB each.
+        //
+        // q_flat is [idx_dim, n_idx_h*n_tps, n_stream] with the head as the fast index, so
+        // head h is a strided view; the copy that makes it contiguous is idx_dim x n_tps,
+        // under a MiB. mul_mat gives [n_tps, n_blocks, n_stream] directly, which is what the
+        // reshape after sum_rows used to produce, so the tail of the branch is unchanged.
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * q_h = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, q_flat, idx_dim, n_tps, n_stream,
+                            n_idx_h*q_flat->nb[1], q_flat->nb[2], h*q_flat->nb[1]));
+
+            ggml_tensor * s_h = ggml_relu(ctx0, ggml_mul_mat(ctx0, q_h, pooled));
+
+            score = score ? ggml_add(ctx0, score, s_h) : s_h;
+        }
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+    } else if (blk_topk) {
+        // execution signature of the single-row gate. Graphs built with
+        // LLAMA_QSA_HEAD_ACC=0 also take this branch, where the gate diverted
+        // nothing: the line is only printed when head_acc was on and we ended up
+        // here because n_tps == 1. Once per process, because every layer of every
+        // graph passes through this point
+        if (head_acc && head_acc_row && n_tps == 1) {
+            static bool row_gate_logged = false;
+            if (!row_gate_logged) {
+                row_gate_logged = true;
+                LLAMA_LOG_WARN("QSA head_acc: single-row gate active (n_tokens=%" PRIu64
+                        ", n_tps=%" PRIu64 ", n_idx_h=%" PRIu64 ", n_blocks=%" PRIu64 ")\n",
+                        (uint64_t) n_tokens, (uint64_t) n_tps,
+                        (uint64_t) n_idx_h, (uint64_t) n_blocks);
+            }
+        }
+
         // Same numbers, one big tensor less. Multiplying the other way round puts the head
         // index in dimension zero, which is the one sum_rows adds up, so the transpose that
         // only existed to feed sum_rows disappears. It weighed [n_blocks, n_idx_h, n_tokens]
@@ -914,6 +1007,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     //
     // It needs the per block bias to carry causality on its own, which set_input_qsa now does, and
     // it needs a single stream so the gather below can flatten tokens into one dimension.
+    // Positive control for the validation bench, and nothing else. With this on, every score is
+    // the same value, so the top-k returns an arbitrary but content independent set of blocks,
+    // in practice the first ones. Retrieval of anything past the first few thousand tokens must
+    // then FAIL. A retrieval test that still passes with this on is a test that was not asking
+    // the question, which is the way this project has failed to notice a broken measurement more
+    // than once. Never set it outside the bench: LLAMA_QSA_SABOTAGE=1
+    static const bool sabotage = [] {
+        const char * e = getenv("LLAMA_QSA_SABOTAGE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    if (sabotage) {
+        score = ggml_fill(ctx0, score, 0.0f);
+    }
+
     if (blk_topk) {
         const int64_t width_blk = std::min<int64_t>(n_blocks, (width + r - 1)/r);
 
@@ -1007,21 +1115,79 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    // Two ways to write the selected cells. Both leave the unselected ones at -INFINITY and the
+    // selected ones at the value the original mask carries, which for a causally hidden cell is
+    // itself -INFINITY, so they agree cell by cell.
+    //
+    // The gather one writes the mask values straight in and has no add at the end. That add
+    // produced a second [n_kv, n_batch] f16 tensor, 588 MiB at ctx 200704 with ub 1536, alive
+    // next to the filled one and next to the original mask, and it read and wrote both of them
+    // for every sparse layer. The gathered values weigh n_top_k instead of n_kv, 12 MiB.
+    //
+    // OFF by default, because measuring it says the opposite of what the count above predicts:
+    // at ctx 200704 with ub 1536 the compute buffer goes from 2812 to 4504 MiB on CUDA0 and
+    // from 3321 to 6914 on Vulkan0. The add was not only an extra tensor, it was the point
+    // where the filled mask died: without it the chain from the fill to flash attention is all
+    // views, the allocator keeps the parent alive to the end of the layer, and the fills of
+    // several sparse layers end up resident together, three on CUDA0 and all six on Vulkan0.
+    // Removing an operation can cost memory when that operation was the one that ended a
+    // lifetime. Turn it on with LLAMA_QSA_MASK_GATHER=1
+    static const bool mask_gather = [] {
+        const char * e = getenv("LLAMA_QSA_MASK_GATHER");
+        return e != nullptr && atoi(e) != 0;
+    }();
 
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+    ggml_tensor * kq_mask_top_k = nullptr;
+
+    if (mask_gather) {
+        // the same [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream] reshape as above,
+        // on the mask that is still intact, so get_rows can pick one cell per selected index
+        ggml_tensor * kq_mask_rows = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+                kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+
+        // [1, n_top_k, n_batch, n_stream], in f32 because get_rows only returns f32
+        ggml_tensor * vals = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
+
+        kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, vals, top_k_3d);
+    } else {
+        // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
+        // this will be our source of zero values for unmasking top k mask elements
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+        // modify KQ mask by unmasking elements that are in top_k indices
+        // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
+        kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+    }
 
     // reshape to restore the original shape of KQ mask:
     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
 
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+    // The add is what merges the original mask into the filled one: -INFINITY plus anything is
+    // -INFINITY for the cells we did not select, and 0 plus the mask value is the mask value for
+    // the ones we did. Out of place it allocates a third [n_kv, n_batch] tensor, 588 MiB at ctx
+    // 200704 with ub 1536, and the allocator debug says the three of them, the input mask, the
+    // filled one and this result, are 1764 of the 2812 MiB of the CUDA0 compute buffer.
+    //
+    // In place it writes back into the filled mask, which we own, and the result is a view, so
+    // nothing is allocated. The risk is the one that sank LLAMA_QSA_MASK_GATHER above: with no
+    // allocating node left, the chain from the fill to flash attention is all views and the
+    // fills of several sparse layers can end up resident together. The difference here is that
+    // the ADD node still exists in the graph, so there is still a node at which the allocator
+    // accounts the parent. Whether that is enough is a measurement, not an argument, so this is
+    // OFF by default. Turn it on with LLAMA_QSA_ADD_INPLACE=1
+    static const bool add_inplace = [] {
+        const char * e = getenv("LLAMA_QSA_ADD_INPLACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    if (!mask_gather) {
+        // combine with the original kq mask
+        kq_mask_top_k = add_inplace
+            ? ggml_add_inplace(ctx0, kq_mask_top_k, kq_mask)
+            : ggml_add        (ctx0, kq_mask_top_k, kq_mask);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
