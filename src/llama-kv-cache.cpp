@@ -750,8 +750,8 @@ uint32_t llama_kv_cache::get_reserve_n_kv() const {
         return get_size();
     }
 
-    // stesso arrotondamento di get_n_kv(), cosi' il grafo riservato ha la stessa forma
-    // di quelli che verranno costruiti davvero
+    // the same rounding as get_n_kv(), so the reserved graph has the same shape
+    // as the ones that will actually be built
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
     return std::min(get_size(), std::max(n_pad_cur, GGML_PAD(n_kv_reserve, n_pad_cur)));

@@ -131,7 +131,7 @@ public:
 
     void set_reserve_limit(uint32_t n_kv_max) override;
 
-    // n_kv da usare per la riserva del grafo, gia' arrotondato e limitato alla dimensione vera
+    // n_kv to use for the graph reserve, already rounded and clamped to the real size
     uint32_t get_reserve_n_kv() const;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
@@ -272,7 +272,7 @@ private:
     // required padding
     const uint32_t n_pad = 1;
 
-    // 0 = riserva sul contesto pieno (comportamento originale)
+    // 0 = reserve on the full context (the original behaviour)
     uint32_t n_kv_reserve = 0;
 
     // SWA

@@ -128,8 +128,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
 }
 
 void llama_memory_hybrid_idx::set_reserve_limit(uint32_t n_kv_max) {
-    // la cache dell'indexer deve seguire quella di attenzione cella per cella, quindi
-    // le due riserve vanno tenute allineate (vedi l'assert in qwen4exp.cpp)
+    // the indexer cache has to follow the attention one cell by cell, so the two
+    // reserves must be kept aligned (see the assert in qwen4exp.cpp)
     llama_memory_hybrid::set_reserve_limit(n_kv_max);
 
     if (mem_idx) {

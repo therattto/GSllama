@@ -89,13 +89,13 @@ static __global__ void k_top_k_radix(const float * __restrict__ x,
     int * __restrict__ dst_row = dst + (size_t) row * k;
 
     __shared__ int   s_hist[256];
-    __shared__ int   s_above;      // quanti elementi stanno sopra il bin scelto
-    __shared__ int   s_bin;        // il bin che contiene il k-esimo
+    __shared__ int   s_above;      // how many elements sit above the chosen bin
+    __shared__ int   s_bin;        // the bin holding the k-th element
     __shared__ int   s_n_hi;       // how many already emitted as strictly greater
     __shared__ int   s_n_eq;       // how many emitted among the threshold ties
     __shared__ uint32_t s_prefix;
     __shared__ uint32_t s_mask;
-    __shared__ int   s_rem;        // quanti ne mancano dentro il prefisso corrente
+    __shared__ int   s_rem;        // how many are still missing inside the current prefix
 
     if (threadIdx.x == 0) {
         s_prefix = 0;
@@ -145,7 +145,7 @@ static __global__ void k_top_k_radix(const float * __restrict__ x,
         __syncthreads();
     }
 
-    const uint32_t thr = s_prefix;   // valore del k-esimo, in forma intera
+    const uint32_t thr = s_prefix;   // the k-th value, in integer form
     const int      n_eq_take = s_rem;
     const int      n_hi_tot  = k - n_eq_take;
 
@@ -198,7 +198,7 @@ static __global__ void k_top_k_radix(const float * __restrict__ x,
             for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
                 const int j = i ^ step;
                 if (j > i) {
-                    const bool up = ((i & len) == 0);          // decrescente nei blocchi "up"
+                    const bool up = ((i & len) == 0);          // decreasing in the "up" blocks
                     const bool sw = up ? (s_val[i] < s_val[j]) : (s_val[i] > s_val[j]);
                     if (sw) {
                         const float tv = s_val[i]; s_val[i] = s_val[j]; s_val[j] = tv;

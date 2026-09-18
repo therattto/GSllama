@@ -4074,9 +4074,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // reads them at the end of every capture. GGML_LOG_INFO cannot be used, because
 // llama-server filters it out by default (common/log.cpp: INFO maps to TRACE=4
 // against a threshold of 3), so the signature is a WARN printed at capture
-static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_total{0};   // fork inseriti nello stream_context
-static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_skipped{0}; // fork candidati e scartati
-static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_rescued{0}; // join ricongiunti dai paracadute
+static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_total{0};   // forks inserted into the stream_context
+static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_skipped{0}; // forks considered and discarded
+static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_rescued{0}; // joins recovered by the safety nets
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;

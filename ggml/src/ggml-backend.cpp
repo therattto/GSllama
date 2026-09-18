@@ -836,7 +836,7 @@ struct ggml_backend_sched {
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
-    int log_realloc;   // conta e stampa le riallocazioni invece di abortire [GGML_SCHED_LOG_REALLOC]
+    int log_realloc;   // count and print the reallocations instead of aborting [GGML_SCHED_LOG_REALLOC]
     int n_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
@@ -2154,8 +2154,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
-    // GGML_SCHED_DEBUG_REALLOC aborta, quindi non si puo' usare per misurare quante
-    // riallocazioni avvengono in un run vero. questa invece conta e basta
+    // GGML_SCHED_DEBUG_REALLOC aborts, so it cannot be used to measure how many
+    // reallocations happen in a real run. This one only counts them
     const char * GGML_SCHED_LOG_REALLOC = getenv("GGML_SCHED_LOG_REALLOC");
     sched->log_realloc = GGML_SCHED_LOG_REALLOC ? atoi(GGML_SCHED_LOG_REALLOC) : 0;
     sched->n_realloc   = 0;

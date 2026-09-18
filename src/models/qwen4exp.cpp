@@ -741,8 +741,8 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        // con il top-k per blocco cell_blk non esiste; blk_cells e blk_pos qui sotto
-        // portano gia' n_blocks, che e' n_kv diviso il ratio
+        // with the block level top-k cell_blk does not exist; blk_cells and blk_pos below
+        // already carry n_blocks, which is n_kv divided by the ratio
         if (cell_blk) {
             res &= cell_blk->ne[0] == n_kv;
             res &= cell_blk->ne[1] == n_stream;
@@ -804,7 +804,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cparams.causal_attn && !hparams.use_alibi;
 
     // sorting the block scores instead of the per cell ones. see the comment further down.
-    // worth 4,4% of prefill and 12,4% of decode at ctx 65536 with ub 1536, and the reason is the
+    // worth 4.4% of prefill and 12.4% of decode at ctx 65536 with ub 1536, and the reason is the
     // graph, not the arithmetic: dropping the per cell gather removes one split per sparse layer,
     // 57 -> 45 at bs=1536 and 43 -> 31 at bs=1.
     // one sequence only: with several, a block can mix them and only the per cell mask can tell
@@ -855,8 +855,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, blk_topk);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        // un input che nessun nodo legge non viene allocato, e set_input scriverebbe su un
-        // puntatore nullo: con il top-k per blocco cell_blk non si costruisce proprio
+        // an input no node reads is never allocated, and set_input would write through a
+        // null pointer: with the block level top-k cell_blk is not built at all
         qsa->cell_blk  = blk_topk ? nullptr : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);

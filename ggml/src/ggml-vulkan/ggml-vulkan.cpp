@@ -14837,9 +14837,9 @@ static bool ggml_vk_can_fuse_hc_combine(ggml_backend_vk_context * ctx, const str
         HC_NO("add_src");
     }
 
-    const ggml_tensor * g = un->src[0];   // il gate prima del sigmoid
+    const ggml_tensor * g = un->src[0];   // the gate before the sigmoid
     const ggml_tensor * a = mul->src[0];  // the already repeated block
-    const ggml_tensor * c = add->src[0];  // il residuo
+    const ggml_tensor * c = add->src[0];  // the residual
 
     if (g->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
         c->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
