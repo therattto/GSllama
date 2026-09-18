@@ -1721,6 +1721,19 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_kv_reserve      = params.n_kv_reserve;
+    // Worst-case reserve cap taken from the environment, because the benchmark
+    // harness can only pass environment variables and cannot reach the -ckv
+    // argument. Idiom: unset means off, and 0 counts the same as unset.
+    // Intended priority: a value given on the command line wins and the
+    // environment does not touch it; a value not below the full context is
+    // ignored.
+    if (params.n_kv_reserve == 0) {
+        const char * nkv_amb = getenv("LLAMA_ARG_CTX_SIZE_RESERVE");
+        const int nkv_val = nkv_amb != nullptr ? atoi(nkv_amb) : 0;
+        if (nkv_val > 0 && (uint32_t)nkv_val < cparams.n_ctx) {
+            cparams.n_kv_reserve = (uint32_t)nkv_val;
+        }
+    }
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);

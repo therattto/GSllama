@@ -608,8 +608,10 @@ void llama_context::sched_reserve() {
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
         if (cparams.n_kv_reserve > 0 && cparams.n_kv_reserve < cparams.n_ctx) {
-            LLAMA_LOG_INFO("%s: reserving compute buffers for n_kv = %u instead of the full %u; "
-                    "they will be grown on demand if the context gets longer\n",
+            // WARN and not INFO: at the default verbosity the benchmark logs
+            // keep only WARN and ERROR, so this marker is the only readable proof.
+            LLAMA_LOG_WARN("%s: ckv-env: reserving the compute buffers on n_kv = %u instead of the full context %u; "
+                    "they grow on demand if the context gets longer\n",
                     __func__, cparams.n_kv_reserve, cparams.n_ctx);
         }
         memory->set_reserve_limit(cparams.n_kv_reserve);
@@ -1350,6 +1352,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    // [GGML_SCHED_BIGSRC_GATE] n_seq_tokens is 1 in decode with any number of
+    // sequences, and is the ubatch chunk during prefill (llama-batch.h). The
+    // marker is set before the reuse branch, not only before alloc_graph: the
+    // reuse branch splits no graph, but leaving it stale from the previous
+    // request would make the gate depend on the order of the runs
+    ggml_backend_sched_set_bigsrc_single_row(sched.get(), ubatch.n_seq_tokens == 1);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2453,6 +2462,11 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
+    // [GGML_SCHED_BIGSRC_GATE] the reserve is never a graph the gate should act
+    // on: the tg path passes n_tokens == n_seqs, so n_seq_tokens comes out as 1
+    // and the reserve would enter the gate on a false premise
+    ggml_backend_sched_set_bigsrc_single_row(sched.get(), false);
+
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
