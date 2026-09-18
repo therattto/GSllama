@@ -156,6 +156,25 @@ and is the part intended for upstream.
 - The generic patches are intended to be proposed upstream. If they land
   there, that is the version you want.
 
+## How this was built
+
+Full disclosure: this fork was built with heavy use of AI agents. Claude Code
+did the typing, ran the benchmarks, and argued with me about the results. The
+method was the same throughout, and it is the part worth copying: propose a
+change, **write down the predicted outcome before measuring**, then measure, and
+keep the prediction next to the number. A fair share of what is in this
+repository is changes that were predicted to help and did not, kept off by
+default with the measurement that killed them written in the comment above.
+
+That cuts both ways, so it is stated plainly. The numbers are real and the
+reasoning is written down rather than asserted. But the volume of code here is
+larger than one person would have typed by hand, and it deserves to be read with
+that in mind. Review it as you would any patch from a stranger.
+
+It also cost an amount in API tokens that is best not converted into hardware.
+The RAM upgrade this README keeps hinting at would have been cheaper, and would
+probably have helped more.
+
 ## License
 
 MIT, same as llama.cpp upstream. See [LICENSE](LICENSE).
