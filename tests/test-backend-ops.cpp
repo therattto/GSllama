@@ -10229,6 +10229,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Elementwise sweep at Qwen3.8-Flash-Next widths (n_embd 2560, hc_dim 10240),
+    // from batch 1 (decode) to 4096 (prefill). Its purpose is to find the size at
+    // which the 7900 XTX stops paying the fixed per-dispatch cost and pulls ahead
+    // of the 4080.
+    for (int64_t n_kv : { 1024, 4096 }) {
+        for (int64_t nh : { 4, 16 }) {
+            test_cases.emplace_back(new test_cont(GGML_TYPE_F32, { n_kv, 512, nh, 1 }, false, { 1, 0, 2, 3 }));
+        }
+    }
+    for (int64_t n : { 2560, 10240 }) {
+        for (int64_t t : { 1, 8, 64, 512, 4096 }) {
+            test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { n, t, 1, 1 }));
+            test_cases.emplace_back(new test_unary(GGML_UNARY_OP_SIGMOID, GGML_TYPE_F32, { n, t, 1, 1 }));
+            test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, { n, t, 1, 1 }, { 1, 1, 1, 1 }));
+            test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, { n, t, 1, 1 }, { 1, 1, 1, 1 }));
+            test_cases.emplace_back(new test_cont(GGML_TYPE_F32, { n, t, 1, 1 }));
+            // same size but transposed 0<->1, which is the Flash indexer permute
+            test_cases.emplace_back(new test_cont(GGML_TYPE_F32, { n, t, 1, 1 }, false, { 1, 0, 2, 3 }));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10369,6 +10390,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // The two slow f32 rows on the 7900 XTX, from our profiling:
+    //   MUL_MAT     f32 m=1 n=64 k=128    22.43 us for 32 KB, i.e. 1.4 GB/s,
+    //                                     six times the RELU floor;
+    //   MUL_MAT_VEC f32 m=4 n=1  k=10240  10.77 us for 164 KB.
+    // Together they are 814 us per graph, 2.5% of the token, and GGML_VK_DMMV_RM
+    // cannot reach them because the source is f32. The first shows up in the
+    // profile as MUL_MAT and not MUL_MAT_VEC, that is, it appears to take the
+    // tiled matmul path despite having a single row. The sweep is there to find
+    // where the step is.
+    for (int64_t n : { 1, 2, 4, 8, 16, 32, 64, 128 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 128, {1, 1}, {1, 1}));
+    }
+    for (int64_t m : { 1, 2, 4, 8, 16 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 64, 128, {1, 1}, {1, 1}));
+    }
+    for (int64_t m : { 1, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 1, 10240, {1, 1}, {1, 1}));
+    }
+
+    // The four slow rows, at the real Qwen3.8-Flash-Next decode shapes
+    // (expert_count 512, expert_used_count 10, n_embd 2560, n_ff_exp 640).
+    // They run at roughly 240 GB/s against a measured ceiling of 740, are worth
+    // 2316 us per graph, that is 18% of the XTX time. The first two are the stdq
+    // family (which on this card starts at rm 1), the other two the iq family
+    // (which starts at 4): they are here to tune GGML_VK_DMMV_RM_STDQ and _IQ
+    // separately.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, 1, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 512, 10, false, 640, 1, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
