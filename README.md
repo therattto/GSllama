@@ -119,6 +119,13 @@ and is the part intended for upstream.
 
 ## Things that cost us time, so they may save you some
 
+The short list is below. The long version, with the measurements behind each
+claim and the ideas that did not survive them, is in **[notes/](notes/)**:
+[how the numbers were taken](notes/method.md),
+[two GPUs in one process](notes/two-gpus.md),
+[memory placement](notes/memory-placement.md), and
+[dead ends](notes/dead-ends.md).
+
 - **`lspci` at idle tells you the opposite of the truth** on Navi 31. The XTX
   reports `16GT/s x16` because the card presents itself as an internal switch,
   and an idle GeForce reports `2.5GT/s` because of power saving. Read the
