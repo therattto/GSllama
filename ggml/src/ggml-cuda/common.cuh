@@ -1272,6 +1272,12 @@ struct ggml_cuda_concurrent_event {
     // Used to restore grouping for fusion within streams
     std::vector<const ggml_tensor *> original_order;
 
+    // Identity mark for the split the event was recorded in: the graph nodes
+    // of each split live in their own view array, and that pointer is the only
+    // thing that tells one split's events apart from another's when the map is
+    // shared (in our configuration the decode graph has 51 splits)
+    ggml_tensor ** graph_nodes = nullptr;
+
     const ggml_tensor * join_node;
 
     ggml_cuda_concurrent_event() = default;
@@ -1295,8 +1301,10 @@ struct ggml_cuda_concurrent_event {
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
     , original_order(std::move(other.original_order))
+    , graph_nodes(other.graph_nodes)
     , join_node(other.join_node) {
         other.fork_event = nullptr;
+        other.graph_nodes = nullptr;
     }
 
     // 1. check if any branches write to overlapping memory ranges (except the join node)

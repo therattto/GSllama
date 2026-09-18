@@ -48,6 +48,185 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
+
+// ---------------------------------------------------------------------------
+//  Radix selection, one block per row.
+//
+//  The fallback used when CCCL has no DeviceTopK (that needs 3.2, here we have
+//  3.1.4) sorts the WHOLE row and then throws away 99% of it. For the sparse
+//  indexer of Qwen3.8-Flash-Next that means sorting n_blocks elements for each
+//  of the n_tps rows just to take the first 513, and the scratch it needs comes
+//  from the CUDA pool, so it does not show up in sched_reserve, it grows with
+//  the prompt, and at ncmoe 15 it kills the process halfway through prefill with
+//  an out of memory inside argsort_f32_i32_cuda_cub.
+//
+//  Here we look only for the threshold, that is the k-th value, with four 8-bit
+//  histogram passes over the monotonic integer representation of the float.
+//  Memory: 256 counters in shared, one kilobyte per block, and no global
+//  scratch. At the end the k chosen positions are sorted in shared with a
+//  bitonic network, because the path this replaces returned indices ordered by
+//  decreasing value and not every caller of ggml_top_k promises not to rely on
+//  that.
+// ---------------------------------------------------------------------------
+
+#define GGML_CUDA_TOPK_RADIX_BLOCK 256
+#define GGML_CUDA_TOPK_RADIX_MAX_K 1024
+
+// monotonic float -> uint32 mapping: the larger the float, the larger the
+// integer, negative and positive zero included
+static __device__ __forceinline__ uint32_t topk_f2u(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+template <bool sort_result>
+static __global__ void k_top_k_radix(const float * __restrict__ x,
+                                     int   * __restrict__ dst,
+                                     const int ncols,
+                                     const int k) {
+    const int row = blockIdx.x;
+    const float * __restrict__ x_row = x + (size_t) row * ncols;
+    int * __restrict__ dst_row = dst + (size_t) row * k;
+
+    __shared__ int   s_hist[256];
+    __shared__ int   s_above;      // quanti elementi stanno sopra il bin scelto
+    __shared__ int   s_bin;        // il bin che contiene il k-esimo
+    __shared__ int   s_n_hi;       // how many already emitted as strictly greater
+    __shared__ int   s_n_eq;       // how many emitted among the threshold ties
+    __shared__ uint32_t s_prefix;
+    __shared__ uint32_t s_mask;
+    __shared__ int   s_rem;        // quanti ne mancano dentro il prefisso corrente
+
+    if (threadIdx.x == 0) {
+        s_prefix = 0;
+        s_mask   = 0;
+        s_rem    = k;
+        s_n_hi   = 0;
+        s_n_eq   = 0;
+    }
+    __syncthreads();
+
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8*pass;
+
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+            s_hist[i] = 0;
+        }
+        __syncthreads();
+
+        const uint32_t prefix = s_prefix;
+        const uint32_t mask   = s_mask;
+
+        for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+            const uint32_t u = topk_f2u(x_row[i]);
+            if ((u & mask) == prefix) {
+                atomicAdd(&s_hist[(u >> shift) & 0xFFu], 1);
+            }
+        }
+        __syncthreads();
+
+        // scan from the top: the first bin that overshoots the remaining quota
+        if (threadIdx.x == 0) {
+            int acc = 0;
+            int bin = 0;
+            for (int b = 255; b >= 0; --b) {
+                if (acc + s_hist[b] >= s_rem) {
+                    bin = b;
+                    break;
+                }
+                acc += s_hist[b];
+            }
+            s_above  = acc;
+            s_bin    = bin;
+            s_rem   -= acc;
+            s_prefix = prefix | ((uint32_t) bin << shift);
+            s_mask   = mask   | (0xFFu << shift);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t thr = s_prefix;   // valore del k-esimo, in forma intera
+    const int      n_eq_take = s_rem;
+    const int      n_hi_tot  = k - n_eq_take;
+
+    // emit: first the strictly greater ones, then as many ties at the threshold as needed
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        const uint32_t u = topk_f2u(x_row[i]);
+        if (u > thr) {
+            const int slot = atomicAdd(&s_n_hi, 1);
+            if (slot < n_hi_tot) {
+                dst_row[slot] = i;
+            }
+        } else if (u == thr) {
+            const int slot = atomicAdd(&s_n_eq, 1);
+            if (slot < n_eq_take) {
+                dst_row[n_hi_tot + slot] = i;
+            }
+        }
+    }
+
+    if (!sort_result) {
+        return;
+    }
+
+    __syncthreads();
+
+    // bitonic sort in shared of the k chosen entries only, by decreasing value
+    extern __shared__ int s_dyn[];
+    int   * s_idx = s_dyn;
+    float * s_val = (float *) (s_dyn + GGML_CUDA_TOPK_RADIX_MAX_K);
+
+    int kpad = 1;
+    while (kpad < k) {
+        kpad *= 2;
+    }
+
+    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+        if (i < k) {
+            const int idx = dst_row[i];
+            s_idx[i] = idx;
+            s_val[i] = x_row[idx];
+        } else {
+            s_idx[i] = -1;
+            s_val[i] = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    for (int len = 2; len <= kpad; len *= 2) {
+        for (int step = len/2; step > 0; step /= 2) {
+            for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+                const int j = i ^ step;
+                if (j > i) {
+                    const bool up = ((i & len) == 0);          // decrescente nei blocchi "up"
+                    const bool sw = up ? (s_val[i] < s_val[j]) : (s_val[i] > s_val[j]);
+                    if (sw) {
+                        const float tv = s_val[i]; s_val[i] = s_val[j]; s_val[j] = tv;
+                        const int   ti = s_idx[i]; s_idx[i] = s_idx[j]; s_idx[j] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        dst_row[i] = s_idx[i];
+    }
+}
+
+static void top_k_radix_cuda(const float * x, int * dst, const int ncols, const int nrows, const int k,
+                             const bool sort_result, cudaStream_t stream) {
+    const dim3 block(GGML_CUDA_TOPK_RADIX_BLOCK, 1, 1);
+    const dim3 grid(nrows, 1, 1);
+    if (sort_result) {
+        const size_t smem = GGML_CUDA_TOPK_RADIX_MAX_K*(sizeof(int) + sizeof(float));
+        k_top_k_radix<true><<<grid, block, smem, stream>>>(x, dst, ncols, k);
+    } else {
+        k_top_k_radix<false><<<grid, block, 0, stream>>>(x, dst, ncols, k);
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -63,6 +242,37 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
+    // Radix selection allocates nothing and beats the full sort when k is much
+    // smaller than ncols, which is the sparse indexer case. Below 1024 columns
+    // the shared-memory bitonic already does everything without scratch, and
+    // above 1024 results the final bitonic would not fit in shared, so in both
+    // of those we keep the existing path. Turn it off with GGML_CUDA_TOPK_RADIX=0.
+    //
+    // When it pays, measured with test-backend-ops perf on this 4080. The kernel
+    // uses one block per row, so its time is about 3.0 us per 1024 columns and
+    // does not depend on nrows as long as the blocks fit in the SMs. The cub sort
+    // instead has a fixed cost of about 80 us and then grows with the total
+    // element count. The two conditions below follow from that: either there are
+    // enough rows to cover cub's fixed cost, or the row is short enough to stay
+    // under it. Outside those two, that is few very long rows (the sampler top-k
+    // over the vocabulary), the single-block radix loses by up to 5x and we leave
+    // it to cub.
+    {
+        static const bool radix_enabled = [] {
+            const char * e = getenv("GGML_CUDA_TOPK_RADIX");
+            return e == nullptr || atoi(e) != 0;
+        }();
+
+        const bool radix_conviene = nrows >= 8 || ncols <= 24576;
+
+        if (radix_enabled && radix_conviene &&
+            ncols > 1024 && k <= GGML_CUDA_TOPK_RADIX_MAX_K && k < ncols && nrows > 0) {
+            top_k_radix_cuda(src0_d, dst_d, (int) ncols, (int) nrows, (int) k, /*sort_result =*/ true, stream);
+            return;
+        }
+    }
+
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391

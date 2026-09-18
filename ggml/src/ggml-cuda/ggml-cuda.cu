@@ -87,6 +87,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -887,6 +889,26 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_cuda_set_device(buft_ctx->device);
 
+    // GGML_CUDA_WAIT_MEM_MS: unset means off, and 0 also means off. A positive
+    // value is the sleep duration in milliseconds, not a multiplier and not a
+    // cap. The gate is on the allocation size only (256 MiB, same as on the
+    // Vulkan side) and not on the free amount: there the wait fired with 166 MiB
+    // free against 1696 requested, exactly when the arithmetic said waiting was
+    // pointless, and that is precisely where it worked.
+    const char * e_ats  = getenv("GGML_CUDA_WAIT_MEM_MS");
+    const int    ats_ms = e_ats != nullptr ? atoi(e_ats) : 0;
+    if (ats_ms > 0 && size >= 256u * 1024u * 1024u) {
+        size_t total = 0, free_before = 0, free_after = 0;
+        if (cudaMemGetInfo(&free_before, &total) == cudaSuccess) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ats_ms));
+            const bool ok = cudaMemGetInfo(&free_after, &total) == cudaSuccess;
+            GGML_LOG_WARN("CUDA inventory: allocating %.1f MiB, total %.0f MiB, free from %.0f to %.0f MiB, waited %d ms\n",
+                          size / 1048576.0, total / 1048576.0,
+                          free_before / 1048576.0,
+                          ok ? free_after / 1048576.0 : -1.0, ats_ms);
+        }
+    }
+
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
@@ -1276,7 +1298,13 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
-    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+    const char * e_np = getenv("GGML_CUDA_NO_PINNED");
+    if (e_np != nullptr && atoi(e_np) != 0) {
+        static bool avvisato_np = false;
+        if (!avvisato_np) {
+            avvisato_np = true;
+            GGML_LOG_WARN("CUDA host buffer: pinning disabled by GGML_CUDA_NO_PINNED, host buffers fall back to the CPU buffer type\n");
+        }
         return nullptr;
     }
 
@@ -4041,6 +4069,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// Counters for the parallel fork detector (GGML_CUDA_GRAPH_OPT):
+// ggml_backend_cuda_graph_optimize updates them and the execution signature
+// reads them at the end of every capture. GGML_LOG_INFO cannot be used, because
+// llama-server filters it out by default (common/log.cpp: INFO maps to TRACE=4
+// against a threshold of 3), so the signature is a WARN printed at capture
+static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_total{0};   // fork inseriti nello stream_context
+static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_skipped{0}; // fork candidati e scartati
+static std::atomic<uint64_t> ggml_cuda_graph_opt_forks_rescued{0}; // join ricongiunti dai paracadute
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4071,15 +4108,48 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    // Rejoins the main stream with every stream of the active fork.
+    // Event-propagated capture (CUDA Programming Guide 4.2.2.1.2.1) requires
+    // that every stream brought in with an event be rejoined to the origin
+    // before cudaStreamEndCapture, or the capture fails
+    const auto join_concurrent_event = [&](void) {
+        cuda_ctx->curr_stream_no = 0;
+        for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+            CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
+                                       cuda_ctx->stream(cuda_ctx->device, i)));
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
+        }
+
+        is_concurrent_event_active = false;
+        concurrent_event           = nullptr;
+    };
+
+    // The forks of this split, counted among the persistent events in the map:
+    // they are the execution signature, and the filter on graph_nodes is what
+    // keeps the splits of one graph apart from each other
+    size_t n_fork_rilevati = 0;
+    for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
+        if (event.graph_nodes == cgraph->nodes) {
+            n_fork_rilevati++;
+        }
+    }
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (stream_ctx.concurrent_events.size() > 0) {
+            if (n_fork_rilevati > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
+                    // Only this split's events count for its launch: the other
+                    // splits' events have keys and tensors that are not in this
+                    // graph, and calling is_valid() on them would mean reading
+                    // the data pointers of a graph that may no longer exist
+                    if (event.graph_nodes != cgraph->nodes) {
+                        continue;
+                    }
                     should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
                 }
             }
@@ -4135,9 +4205,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cgraph->nodes[start_pos + i] = const_cast<ggml_tensor *>(event.original_order[i]);
                     }
                 }
-            } else {
-                stream_ctx.concurrent_events.clear();
             }
+            // Upstream had a clear() here when an event was not valid: with the
+            // map shared across splits that would also have erased the events of
+            // the following splits, before they were even computed. An invalid
+            // event must not be launched, but that is not the other splits'
+            // fault: graph_optimize cleans up stale versions when it rebuilds
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4145,20 +4218,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_ASSERT(concurrent_event);
 
                     if (node == concurrent_event->join_node) {
-                        cuda_ctx->curr_stream_no = 0;
-                        for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-                            // Wait on join events of forked streams in the main stream
-                            CUDA_CHECK(cudaEventRecord(concurrent_event->join_events[i - 1],
-                                                       cuda_ctx->stream(cuda_ctx->device, i)));
-                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), concurrent_event->join_events[i - 1]));
-                        }
-
-                        is_concurrent_event_active = false;
-                        concurrent_event           = nullptr;
+                        // Wait on join events of forked streams in the main stream
+                        join_concurrent_event();
                     } else {
-                        GGML_ASSERT (concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
-                        cuda_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
-                        GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        const auto it_map = concurrent_event->stream_mapping.find(node);
+                        if (it_map == concurrent_event->stream_mapping.end()) {
+                            // Safety net: the join_node was never reached
+                            // because a fusion consumed it as a follower
+                            // (i += nodes_to_skip), or because the split ends
+                            // first. The assert that used to be here, which in
+                            // this build is GGML_ABORT even with NDEBUG
+                            // (ggml.h:288), would have killed the server on the
+                            // very first request: here we rejoin and carry on
+                            if (ggml_cuda_graph_opt_forks_rescued.fetch_add(1, std::memory_order_relaxed) < 10) {
+                                GGML_LOG_WARN("%s: fork with no join, rejoined after the fact before %s\n",
+                                              __func__, node->name);
+                            }
+                            join_concurrent_event();
+                        } else {
+                            cuda_ctx->curr_stream_no = it_map->second;
+                            GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cuda_ctx->curr_stream_no, node->name);
+                        }
                     }
                 } else if (i - prev_i > 1) {
                     //the previous node was fused
@@ -4225,6 +4305,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            // Safety net: a fork still active at the end of the graph leaves the
+            // branch streams in capture, and by the event-propagated capture rule
+            // that fails the whole cudaStreamEndCapture. A late join beats an
+            // abort
+            if (is_concurrent_event_active) {
+                if (ggml_cuda_graph_opt_forks_rescued.fetch_add(1, std::memory_order_relaxed) < 10) {
+                    GGML_LOG_WARN("%s: fork with no join at the end of the capture, rejoining after the fact\n",
+                                  __func__);
+                }
+                join_concurrent_event();
+            }
+
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
@@ -4232,6 +4324,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+
+            // Execution signature: one line per capture, not per token. The fork
+            // count should be of the same order as the number of dense-attention
+            // layers living on the CUDA device; if it stays zero the candidate is
+            // dead and no benchmark is worth starting
+            static bool sig_stampata = false;
+            if (n_fork_rilevati > 0 || !sig_stampata) {
+                sig_stampata = true;
+                GGML_LOG_WARN("%s: capture key=%llu, fork rilevati=%zu, lanciati=%d, "
+                              "totali=%llu, scartati=%llu, ricongiunti=%llu\n",
+                              __func__, (unsigned long long) graph_key, n_fork_rilevati,
+                              (int) should_launch_concurrent_events,
+                              (unsigned long long) ggml_cuda_graph_opt_forks_total.load(std::memory_order_relaxed),
+                              (unsigned long long) ggml_cuda_graph_opt_forks_skipped.load(std::memory_order_relaxed),
+                              (unsigned long long) ggml_cuda_graph_opt_forks_rescued.load(std::memory_order_relaxed));
+            }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -4361,7 +4469,9 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 }
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    GGML_UNUSED(params);
+    // params->add_alloc_dep is no longer ignored: we use it where the fork is
+    // inserted, to keep alive the tensors the branches read while another stream
+    // is still using them
 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4384,7 +4494,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
-    stream_context.reset();
+
+    // Upstream had a stream_context.reset() here that emptied the event map on
+    // every split: on this machine the decode graph has 51 alternating splits, so
+    // the reset left the fork in the single last CUDA split of the graph, one out
+    // of thirty and a half. Now the events stay in the map for the whole graph
+    // computation, and cleanup is per split: only events whose key is among this
+    // split's nodes are erased, because those are the ones from rebuilding this
+    // split (on a reused graph the keys are the same, and are re-created fresh
+    // below). The events of a graph that was built and never computed again stay
+    // in the map with no key reaching them, and the filter on graph_nodes at
+    // computation time does the rest: a graph cannot inherit the events of a
+    // previous round
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        stream_context.concurrent_events.erase(cgraph->nodes[i]);
+    }
 
     if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
         return;
@@ -4424,6 +4548,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
             const ggml_tensor * src = cgraph->nodes[node_idx]->src[src_idx];
+            if (src == nullptr) {
+                // Unused slots would enter the count with a nullptr key: that is
+                // not a tensor, it has no name, and in a small graph it could even
+                // pass the counting test
+                continue;
+            }
             //TODO: check why nrows > 1 fails
             if (node && !is_noop(node) && ggml_nrows(node) <= 1) {
                 fan_out[src] += 1;
@@ -4448,11 +4578,43 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     for (const auto & [root_node, count] : fan_out) {
         if (count >= min_fan_out && count <= max_fan_out) {
+            // A root that is itself a view operation has no index in
+            // node_indices (the map is only filled with non-noop nodes), and the
+            // lookup below would hand it the default index 0: discard it first,
+            // so no fork is built starting from the wrong index
+            if (is_noop(root_node)) {
+                continue;
+            }
+
             const int root_node_idx = node_indices[root_node];
 
-            // only optimize for attn_norm
-            // TODO: make this more generic
-            if (!strstr(root_node->name, "attn_norm")) {
+            // Shape filter instead of the name filter: "attn_norm" is never
+            // written by the models we run, so the old filter let nothing
+            // through. The shape we are after is there: a root is accepted only
+            // if every direct non-noop consumer of it is a MUL_MAT, that is the
+            // three Q, K and V mat-vecs reading the hc_mixed-<il> cb in the
+            // dense-attention layers. The FFN block's hc_mixed carries the same
+            // name but its consumers are not three MUL_MATs, and the contiguity
+            // check further down remains the real guard
+            bool consumers_ok = true;
+            for (int i = root_node_idx + 1; consumers_ok && i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * consumer = cgraph->nodes[i];
+                if (is_noop(consumer)) {
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (consumer->src[j] != root_node) {
+                        continue;
+                    }
+                    if (consumer->op != GGML_OP_MUL_MAT) {
+                        consumers_ok = false;
+                    }
+                    break;
+                }
+            }
+            if (!consumers_ok) {
+                GGML_LOG_DEBUG("%s: fork %s discarded, consumers are not MUL_MAT\n", __func__, root_node->name);
+                ggml_cuda_graph_opt_forks_skipped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
@@ -4475,7 +4637,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
-            GGML_ASSERT(nodes_per_branch.size() == (size_t) count);
+            // GGML_ASSERT is GGML_ABORT even with NDEBUG (ggml.h:288): a root
+            // that does not add up must not kill the server, only discard the
+            // fork
+            if (nodes_per_branch.size() != (size_t) count) {
+                GGML_LOG_DEBUG("%s: fork %s discarded, %zu branches collected against %d counted\n",
+                               __func__, root_node->name, nodes_per_branch.size(), count);
+                ggml_cuda_graph_opt_forks_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
 
             //find the join point
             const ggml_tensor * join_node = nullptr;
@@ -4564,8 +4734,45 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
 
                 std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> & concurrent_events = cuda_ctx->stream_context().concurrent_events;
-                GGML_ASSERT(concurrent_events.find(root_node) == concurrent_events.end());
+                // This one was also a GGML_ABORT dressed up as an assert
+                if (concurrent_events.find(root_node) != concurrent_events.end()) {
+                    GGML_LOG_DEBUG("%s: fork %s discarded, event already present\n", __func__, root_node->name);
+                    ggml_cuda_graph_opt_forks_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+
+                // Memory reuse between branches is the problem left open by the
+                // upstream PR. The branches run on parallel streams, so the
+                // allocator must not recycle inside a branch the memory another
+                // stream is still reading: for every output of a branch node, and
+                // for every source read inside the branch, we declare the
+                // dependency up to the join_node. Only among tensors computed in
+                // the graph, because weights and inputs are never recycled and the
+                // dependency nodes the scheduler would materialize for them would
+                // cost time on every round
+                if (params != nullptr && params->add_alloc_dep != nullptr) {
+                    for (const auto & mapping : concurrent_event.stream_mapping) {
+                        const ggml_tensor * branch_node = mapping.first;
+                        if ((branch_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(branch_node),
+                                                  const_cast<ggml_tensor *>(join_node));
+                        }
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            const ggml_tensor * src = branch_node->src[j];
+                            if (src == nullptr || (src->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                                continue;
+                            }
+                            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(src),
+                                                  const_cast<ggml_tensor *>(join_node));
+                        }
+                    }
+                }
+
+                // The event belongs to this split, and the mark says so
+                concurrent_event.graph_nodes = cgraph->nodes;
+
                 concurrent_events.emplace(root_node, std::move(concurrent_event));
+                ggml_cuda_graph_opt_forks_total.fetch_add(1, std::memory_order_relaxed);
                 GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
                 concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
 
@@ -4865,7 +5072,9 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
     ggml_backend_cuda_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
-    bool host_buffer = getenv("GGML_CUDA_NO_PINNED") == nullptr;
+    const char * e_np = getenv("GGML_CUDA_NO_PINNED");
+    const bool host_buffer = !(e_np != nullptr && atoi(e_np) != 0);
+    GGML_LOG_WARN("host buffer CUDA: %s\n", host_buffer ? "pinnato" : "no");
 #ifdef GGML_CUDA_NO_PEER_COPY
     bool events = false;
 #else
